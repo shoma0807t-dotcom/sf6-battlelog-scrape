@@ -6,9 +6,6 @@ on:
     # 毎日 21:00 JST（12:00 UTC）に自動実行。不要なら削除してOK。
     - cron: "0 12 * * *"
 
-permissions:
-  contents: write
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -19,8 +16,21 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package.json') }}
+
       - name: Install dependencies
         run: npm install
+
+      - name: Cache Playwright browser binary
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('package.json') }}
 
       - name: Install Playwright browser (Chromium only)
         run: npx playwright install --with-deps chromium
@@ -30,6 +40,8 @@ jobs:
           CAPCOM_ID_EMAIL: ${{ secrets.CAPCOM_ID_EMAIL }}
           CAPCOM_ID_PASSWORD: ${{ secrets.CAPCOM_ID_PASSWORD }}
           SF6_FIGHTER_ID: ${{ secrets.SF6_FIGHTER_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: node scrape.js
 
       - name: Upload debug artifacts on failure
@@ -41,11 +53,3 @@ jobs:
             output/debug-last-page.png
             output/debug-last-url.txt
           if-no-files-found: ignore
-
-      - name: Commit and push if changed
-        run: |
-          git config user.name "sf6-battlelog-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add output/battlelog.json
-          git diff --cached --quiet || git commit -m "chore: update battlelog $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push
