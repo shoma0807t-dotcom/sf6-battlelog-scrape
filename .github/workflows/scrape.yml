@@ -1,0 +1,51 @@
+name: Scrape SF6 battlelog
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 毎日 21:00 JST（12:00 UTC）に自動実行。不要なら削除してOK。
+    - cron: "0 12 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browser (Chromium only)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          CAPCOM_ID_EMAIL: ${{ secrets.CAPCOM_ID_EMAIL }}
+          CAPCOM_ID_PASSWORD: ${{ secrets.CAPCOM_ID_PASSWORD }}
+          SF6_FIGHTER_ID: ${{ secrets.SF6_FIGHTER_ID }}
+        run: node scrape.js
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: |
+            output/debug-last-page.png
+            output/debug-last-url.txt
+          if-no-files-found: ignore
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "sf6-battlelog-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add output/battlelog.json
+          git diff --cached --quiet || git commit -m "chore: update battlelog $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
