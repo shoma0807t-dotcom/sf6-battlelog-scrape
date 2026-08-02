@@ -23,8 +23,54 @@ const MAX_PAGES = parseInt(process.env.SF6_MAX_PAGES || "20", 10);
 const OUT_DIR = path.join(__dirname, "output");
 const LOGIN_URL = `https://www.streetfighter.com/6/buckler/${LOCALE}/auth/loginep?redirect_url=/`;
 
+const GIST_TOKEN = process.env.GIST_TOKEN || "";
+const GIST_ID = process.env.GIST_ID || "";
+const GIST_FILENAME = "battlelog.json";
+
 if (!EMAIL || !PASSWORD) { console.error("CAPCOM_ID_EMAIL / CAPCOM_ID_PASSWORD が設定されていません"); process.exit(1); }
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
+if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
+
+// Gistへ battlelog.json をアップロードする。
+// GIST_IDが指定されていれば既存のGistを更新し、なければ新規のsecret gistを作成する
+// （その場合は次回以降のためにGIST_IDをSecretsへ追加する必要がある旨をログに出す）。
+async function uploadToGist(content) {
+  const headers = {
+    "Authorization": `Bearer ${GIST_TOKEN}`,
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "Content-Type": "application/json",
+  };
+  if (GIST_ID) {
+    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ files: { [GIST_FILENAME]: { content } } }),
+    });
+    if (!res.ok) throw new Error(`Gistの更新に失敗しました: HTTP ${res.status} ${await res.text()}`);
+    const data = await res.json();
+    console.log("Gistを更新しました:", data.html_url);
+    return data;
+  }
+  const res = await fetch("https://api.github.com/gists", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      description: "SF6 battlelog (sf6-note用)",
+      public: false,
+      files: { [GIST_FILENAME]: { content } },
+    }),
+  });
+  if (!res.ok) throw new Error(`Gistの作成に失敗しました: HTTP ${res.status} ${await res.text()}`);
+  const data = await res.json();
+  console.log("=====================================================");
+  console.log("新しいGistを作成しました。次回以降も同じGistを更新するために、");
+  console.log("リポジトリのSecretsに GIST_ID を以下の値で追加登録してください：");
+  console.log("GIST_ID =", data.id);
+  console.log("Gist URL:", data.html_url);
+  console.log("=====================================================");
+  return data;
+}
 
 async function login(page) {
   console.log("ログインページへ移動:", LOGIN_URL);
@@ -110,8 +156,10 @@ async function main() {
         fetched_at: new Date().toISOString(),
       },
     };
-    fs.writeFileSync(path.join(OUT_DIR, "battlelog.json"), JSON.stringify(output, null, 2));
-    console.log(`${allReplays.length}件を output/battlelog.json に書き出しました`);
+    const outputText = JSON.stringify(output, null, 2);
+    fs.writeFileSync(path.join(OUT_DIR, "battlelog.json"), outputText);
+    console.log(`${allReplays.length}件を取得しました。Gistへアップロードします。`);
+    await uploadToGist(outputText);
   } catch (e) {
     // デバッグ用にログイン試行後のスクリーンショットを残しておく（Secretsは映らない）
     try {
