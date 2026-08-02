@@ -31,6 +31,35 @@ if (!EMAIL || !PASSWORD) { console.error("CAPCOM_ID_EMAIL / CAPCOM_ID_PASSWORD �
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
 if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
 
+// 既存のGistの中身（前回までに蓄積した対戦履歴）を取得する。
+// これと今回の取得分を replay_id で突き合わせ、新しいものだけを追加していく
+// （公式サイト側は直近100戦しか保持していないため、こちらで蓄積しないと古いデータが消えてしまう）。
+async function fetchExistingReplays() {
+  if (!GIST_ID) return [];
+  const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+    headers: {
+      "Authorization": `Bearer ${GIST_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    console.warn(`既存Gistの取得に失敗しました（HTTP ${res.status}）。新規扱いとして続行します。`);
+    return [];
+  }
+  const gist = await res.json();
+  const file = gist.files && gist.files[GIST_FILENAME];
+  if (!file || !file.content) return [];
+  try {
+    const parsed = JSON.parse(file.content);
+    const pp = parsed.pageProps || parsed;
+    return pp.replay_list || [];
+  } catch (e) {
+    console.warn("既存Gistの中身のパースに失敗しました。新規扱いとして続行します。");
+    return [];
+  }
+}
+
 // Gistへ battlelog.json をアップロードする。
 // GIST_IDが指定されていれば既存のGistを更新し、なければ新規のsecret gistを作成する
 // （その場合は次回以降のためにGIST_IDをSecretsへ追加する必要がある旨をログに出す）。
@@ -158,8 +187,29 @@ async function main() {
     };
     const outputText = JSON.stringify(output, null, 2);
     fs.writeFileSync(path.join(OUT_DIR, "battlelog.json"), outputText);
-    console.log(`${allReplays.length}件を取得しました。Gistへアップロードします。`);
-    await uploadToGist(outputText);
+    console.log(`今回の取得: ${allReplays.length}件`);
+
+    // replay_idを主キーとして、既存のGistの中身とマージする（サイト側は直近100戦しか
+    // 保持していないため、ここで蓄積しないと古いデータが失われる）。
+    console.log("既存のGistの中身を確認します。");
+    const existingReplays = await fetchExistingReplays();
+    const existingIds = new Set(existingReplays.map((r) => r.replay_id));
+    const newReplays = allReplays.filter((r) => !existingIds.has(r.replay_id));
+    const merged = [...existingReplays, ...newReplays]
+      .sort((a, b) => (a.uploaded_at || 0) - (b.uploaded_at || 0));
+
+    console.log(`既存: ${existingReplays.length}件 / 新規: ${newReplays.length}件 / 累計: ${merged.length}件`);
+
+    const mergedOutput = {
+      pageProps: {
+        fighter_banner_info: fighterBannerInfo,
+        replay_list: merged,
+        fetched_at: new Date().toISOString(),
+      },
+    };
+    const mergedText = JSON.stringify(mergedOutput, null, 2);
+    fs.writeFileSync(path.join(OUT_DIR, "battlelog.json"), mergedText);
+    await uploadToGist(mergedText);
   } catch (e) {
     // デバッグ用にログイン試行後のスクリーンショットを残しておく（Secretsは映らない）
     try {
