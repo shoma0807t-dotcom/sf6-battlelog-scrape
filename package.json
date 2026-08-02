@@ -1,0 +1,11 @@
+{
+  "name": "sf6-battlelog-scraper",
+  "private": true,
+  "version": "2.0.0",
+  "scripts": {
+    "scrape": "node scrape.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
