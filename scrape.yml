@@ -8,6 +8,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,11 +26,18 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
         run: node scrape.js
 
-      - name: Upload debug artifacts on failure
-        if: failure()
+      - name: Show debug files
+        if: always()
+        run: |
+          echo "=== output directory ==="
+          ls -la output 2>/dev/null || echo "output does not exist"
+          echo "=== all files ==="
+          find . -maxdepth 4 -type f -print
+
+      - name: Upload debug artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-output
-          path: |
-            output/debug-*.html
-          if-no-files-found: ignore
+          path: output/
+          if-no-files-found: warn
