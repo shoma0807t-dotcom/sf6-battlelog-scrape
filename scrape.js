@@ -1,73 +1,59 @@
- · JS
 // Buckler's Boot Camp（SF6公式サイト）内部APIから対戦履歴を直接取得し、
 // スト6攻略ノートアプリがそのままインポートできる形式でGistへアップロードする。
 //
 // 方針：
 // - Playwright等のブラウザ自動化は使わない（Bot対策に検知されうるため）。
-//   ログインも素のHTTPリクエスト（fetch + 手作りCookie Jar）だけで行う。
-//   ブラウザを一切起動しないので、Bot判定の対象になりようがない。
-// - ログイン方法は2通り対応：
-//   ① CAPCOM_ID_EMAIL / CAPCOM_ID_PASSWORD が設定されていれば、毎回HTTPでログインしてCookieを得る
-//   ② SF6_SESSION_COOKIE が設定されていれば、それをそのまま使う（①が使えない場合の手動フォールバック）
+//   ログイン中のブラウザからコピーしたセッションCookieを、素のfetch()でAPIリクエストに
+//   直接乗せるだけ。ブラウザ操作を一切行わないので軽量・確実。
 // - replay_id を主キーとした差分取得（前回までに取得済みのreplay_idに行き当たったら
 //   それ以降のページは取得を打ち切る＝無駄なリクエストをしない）。
 // - HTTPステータスごとに挙動を分ける（429は待ってリトライ、401/403は即座に諦める等）。
 // - 生のAPIレスポンス（raw）と、アプリ用に蓄積した結果（data）を分けてGistに保存する。
 //   API仕様が変わった場合でも、rawを見れば実際に何が返ってきていたか確認できる。
 //
-// 注意：HTTPログイン部分（httpLogin関数）は、実際にDevToolsで確認できた
-// /usernamepassword/login への送信内容（フィールド名）を元に組んでいるが、
-// POST後のレスポンス形式（リダイレクトか、自動送信フォームを含むHTMLか）は未検証。
-// 失敗した場合は output/debug-login-*.html にその時点のレスポンスを保存するので、
-// それを見ながら調整する前提。
-//
 // 必要な環境変数（GitHub Secrets経由で渡す想定）:
-//   CAPCOM_ID_EMAIL      … CAPCOM IDのログインメールアドレス（①の方式）
-//   CAPCOM_ID_PASSWORD   … CAPCOM IDのログインパスワード（①の方式）
-//   SF6_SESSION_COOKIE  … ログイン済みブラウザからコピーしたCookie文字列（②の方式）
+//   SF6_SESSION_COOKIE  … ログイン済みブラウザからコピーしたCookie文字列
 //   SF6_FIGHTER_ID       … 自分のCFNプレイヤーID（プロフィールページURLの数字部分）
 //   SF6_LOCALE           … 省略時 "ja-jp"
 //   SF6_MAX_PAGES         … 省略時 20（安全のための上限ページ数）
 //   SF6_REQUEST_DELAY_MS   … 省略時 400（各リクエストの間隔・レート制限対策）
 //   GIST_TOKEN            … Gist更新用のPersonal Access Token（gistスコープ）
 //   GIST_ID               … 更新先のGist ID
- 
+
 const fs = require("fs");
 const path = require("path");
- 
-const EMAIL = process.env.CAPCOM_ID_EMAIL || "";
-const PASSWORD = process.env.CAPCOM_ID_PASSWORD || "";
-const MANUAL_COOKIE = process.env.SF6_SESSION_COOKIE || "";
+
+const COOKIE = process.env.SF6_SESSION_COOKIE || "";
 const FIGHTER_ID = process.env.SF6_FIGHTER_ID || "";
 const LOCALE = process.env.SF6_LOCALE || "ja-jp";
 const MAX_PAGES = parseInt(process.env.SF6_MAX_PAGES || "20", 10);
 const REQUEST_DELAY_MS = parseInt(process.env.SF6_REQUEST_DELAY_MS || "400", 10);
 const OUT_DIR = path.join(__dirname, "output");
- 
+
 const GIST_TOKEN = process.env.GIST_TOKEN || "";
 const GIST_ID = process.env.GIST_ID || "";
 const GIST_FILENAME = "battlelog.json";
 const GIST_RAW_FILENAME = "battlelog-raw.json";
- 
+
 if (!COOKIE) { console.error("SF6_SESSION_COOKIE が設定されていません"); process.exit(1); }
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
 if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
- 
+
 const HEADERS = {
   "Cookie": COOKIE,
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
 };
- 
+
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
- 
+
 // HTTPステータスに応じて処理を分ける汎用フェッチ。
 // 429/5xx系はしばらく待ってリトライ（最大3回）、401/403/404は即座に諦めて呼び出し元に伝える。
 async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const res = await fetch(url, { headers: HEADERS });
     if (res.ok) return res;
- 
+
     if (res.status === 401) {
       throw new Error("HTTP 401: 認証切れです。SF6_SESSION_COOKIE を取り直してSecretsを更新してください。");
     }
@@ -88,12 +74,12 @@ async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
     throw new Error(`HTTP ${res.status}: 予期しないエラー（${url}）`);
   }
 }
- 
+
 async function fetchText(url) {
   const res = await fetchWithRetry(url);
   return res.text();
 }
- 
+
 // プロフィールページのHTMLから __NEXT_DATA__ に埋め込まれた buildId を取り出す。
 // buildIdはサイトのデプロイごとに変わるため毎回取得し直す。
 async function getBuildId() {
@@ -104,13 +90,13 @@ async function getBuildId() {
   if (!data.buildId) throw new Error("buildId が取得できませんでした");
   return data.buildId;
 }
- 
+
 async function fetchBattlelogPage(buildId, page) {
   const url = `https://www.streetfighter.com/6/buckler/_next/data/${buildId}/${LOCALE}/profile/${FIGHTER_ID}/battlelog.json?page=${page}&sid=${FIGHTER_ID}`;
   const text = await fetchText(url);
   return JSON.parse(text);
 }
- 
+
 // 既存Gistの中身（前回までに蓄積した対戦履歴・data側）を取得する。
 async function fetchExistingReplays() {
   if (!GIST_ID) return [];
@@ -137,7 +123,7 @@ async function fetchExistingReplays() {
     return [];
   }
 }
- 
+
 // Gistの複数ファイルをまとめて更新する。GIST_IDが指定されていれば既存のGistを更新し、
 // なければ新規のsecret gistを作成する（その場合は次回以降のためにGIST_IDをSecretsへ
 // 追加登録する必要がある旨をログに出す）。
@@ -174,26 +160,26 @@ async function uploadToGist(files) {
   console.log("=====================================================");
   return data;
 }
- 
+
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
- 
+
   // 差分取得のため、先に既存データ（前回までの蓄積）を取得しておく
   console.log("既存のGistの中身を確認します。");
   const existingReplays = await fetchExistingReplays();
   const existingIds = new Set(existingReplays.map((r) => r.replay_id));
   console.log(`既存: ${existingReplays.length}件`);
- 
+
   const buildId = await getBuildId();
   console.log("buildId:", buildId);
- 
+
   let fighterBannerInfo = null;
   const allReplays = [];
   const rawPages = [];
- 
+
   for (let p = 1; p <= MAX_PAGES; p++) {
     if (p > 1) await sleep(REQUEST_DELAY_MS); // レート制限対策：リクエスト間隔を空ける
- 
+
     let data;
     try {
       data = await fetchBattlelogPage(buildId, p);
@@ -202,13 +188,13 @@ async function main() {
       break;
     }
     rawPages.push({ page: p, fetched_at: new Date().toISOString(), data });
- 
+
     const pp = data.pageProps || {};
     if (!fighterBannerInfo) fighterBannerInfo = pp.fighter_banner_info;
     const list = pp.replay_list || [];
     console.log(`page ${p}: ${list.length}件 (total_page=${pp.total_page})`);
     allReplays.push(...list);
- 
+
     // このページの中身が全部既知のreplay_idだった＝それ以前のページも全部既知のはずなので、
     // ここで打ち切る（無駄なリクエストを避ける差分取得）
     const allKnown = list.length > 0 && list.every((r) => existingIds.has(r.replay_id));
@@ -218,15 +204,15 @@ async function main() {
     }
     if (!list.length || (pp.total_page && p >= pp.total_page)) break;
   }
- 
+
   console.log(`今回の取得: ${allReplays.length}件`);
- 
+
   const newReplays = allReplays.filter((r) => !existingIds.has(r.replay_id));
   const merged = [...existingReplays, ...newReplays]
     .sort((a, b) => (a.uploaded_at || 0) - (b.uploaded_at || 0));
- 
+
   console.log(`新規: ${newReplays.length}件 / 累計: ${merged.length}件`);
- 
+
   const dataOutput = {
     pageProps: {
       fighter_banner_info: fighterBannerInfo,
@@ -236,16 +222,16 @@ async function main() {
   };
   const dataText = JSON.stringify(dataOutput, null, 2);
   const rawText = JSON.stringify({ fetched_at: new Date().toISOString(), pages: rawPages }, null, 2);
- 
+
   fs.writeFileSync(path.join(OUT_DIR, GIST_FILENAME), dataText);
   fs.writeFileSync(path.join(OUT_DIR, GIST_RAW_FILENAME), rawText);
- 
+
   await uploadToGist({
     [GIST_FILENAME]: { content: dataText },
     [GIST_RAW_FILENAME]: { content: rawText },
   });
 }
- 
+
 main().catch((e) => {
   console.error("失敗:", e.message);
   process.exit(1);
