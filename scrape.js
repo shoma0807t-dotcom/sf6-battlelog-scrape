@@ -3,16 +3,26 @@
 //
 // 方針：
 // - Playwright等のブラウザ自動化は使わない（Bot対策に検知されうるため）。
-//   ログイン中のブラウザからコピーしたセッションCookieを、素のfetch()でAPIリクエストに
-//   直接乗せるだけ。ブラウザ操作を一切行わないので軽量・確実。
+//   ログインも素のHTTPリクエスト（fetch + 手作りCookie Jar）だけで行う。
+//   ブラウザを一切起動しないので、Bot判定の対象になりようがない。
+// - ログイン方法は2通り対応：
+//   ① CAPCOM_ID_EMAIL / CAPCOM_ID_PASSWORD が設定されていれば、毎回HTTPでログインしてCookieを得る
+//   ② SF6_SESSION_COOKIE が設定されていれば、それをそのまま使う（①が使えない場合の手動フォールバック）
 // - replay_id を主キーとした差分取得（前回までに取得済みのreplay_idに行き当たったら
 //   それ以降のページは取得を打ち切る＝無駄なリクエストをしない）。
 // - HTTPステータスごとに挙動を分ける（429は待ってリトライ、401/403は即座に諦める等）。
 // - 生のAPIレスポンス（raw）と、アプリ用に蓄積した結果（data）を分けてGistに保存する。
-//   API仕様が変わった場合でも、rawを見れば実際に何が返ってきていたか確認できる。
+//
+// 注意：httpLogin()内のフィールド名（client_id, connection, state, _csrf 等）は
+// 実際にDevToolsで確認できた /usernamepassword/login への送信内容そのもの。
+// ただし state/_csrf をログインページのHTMLからどう抽出するか、POST後のレスポンスが
+// リダイレクトかHTML自動送信フォームかは未検証。失敗した場合は
+// output/debug-login-*.html にその時点のレスポンスを保存するので、それを見て調整する。
 //
 // 必要な環境変数（GitHub Secrets経由で渡す想定）:
-//   SF6_SESSION_COOKIE  … ログイン済みブラウザからコピーしたCookie文字列
+//   CAPCOM_ID_EMAIL      … CAPCOM IDのログインメールアドレス（①の方式・推奨）
+//   CAPCOM_ID_PASSWORD   … CAPCOM IDのログインパスワード（①の方式・推奨）
+//   SF6_SESSION_COOKIE  … ログイン済みブラウザからコピーしたCookie文字列（②の方式・フォールバック）
 //   SF6_FIGHTER_ID       … 自分のCFNプレイヤーID（プロフィールページURLの数字部分）
 //   SF6_LOCALE           … 省略時 "ja-jp"
 //   SF6_MAX_PAGES         … 省略時 20（安全のための上限ページ数）
@@ -23,7 +33,9 @@
 const fs = require("fs");
 const path = require("path");
 
-const COOKIE = process.env.SF6_SESSION_COOKIE || "";
+const EMAIL = process.env.CAPCOM_ID_EMAIL || "";
+const PASSWORD = process.env.CAPCOM_ID_PASSWORD || "";
+const MANUAL_COOKIE = process.env.SF6_SESSION_COOKIE || "";
 const FIGHTER_ID = process.env.SF6_FIGHTER_ID || "";
 const LOCALE = process.env.SF6_LOCALE || "ja-jp";
 const MAX_PAGES = parseInt(process.env.SF6_MAX_PAGES || "20", 10);
@@ -35,27 +47,219 @@ const GIST_ID = process.env.GIST_ID || "";
 const GIST_FILENAME = "battlelog.json";
 const GIST_RAW_FILENAME = "battlelog-raw.json";
 
-if (!COOKIE) { console.error("SF6_SESSION_COOKIE が設定されていません"); process.exit(1); }
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+if (!EMAIL && !MANUAL_COOKIE) { console.error("CAPCOM_ID_EMAIL/CAPCOM_ID_PASSWORD か SF6_SESSION_COOKIE のいずれかが必要です"); process.exit(1); }
+if (EMAIL && !PASSWORD) { console.error("CAPCOM_ID_EMAIL はあるが CAPCOM_ID_PASSWORD がありません"); process.exit(1); }
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
 if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
 
-const HEADERS = {
-  "Cookie": COOKIE,
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-  "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
-};
-
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+/* ------------------------------------------------------------------------
+   簡易Cookie Jar（ブラウザなしで複数リクエストにまたがってCookieを保持する）
+   ------------------------------------------------------------------------ */
+class CookieJar {
+  constructor() { this.map = new Map(); }
+  absorb(res) {
+    const setCookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    setCookies.forEach((sc) => {
+      const pair = sc.split(";")[0];
+      const eq = pair.indexOf("=");
+      if (eq > -1) this.map.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    });
+  }
+  header() { return [...this.map.entries()].map(([k, v]) => `${k}=${v}`).join("; "); }
+}
+
+// リダイレクトを自前で1段ずつ辿る（Cookieを都度吸収するため redirect:"manual" にしている）
+async function fetchFollow(jar, url, opts = {}, maxHops = 10) {
+  let current = url;
+  let curOpts = opts;
+  for (let i = 0; i < maxHops; i++) {
+    const res = await fetch(current, {
+      ...curOpts,
+      redirect: "manual",
+      headers: { "User-Agent": UA, Cookie: jar.header(), ...(curOpts.headers || {}) },
+    });
+    jar.absorb(res);
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get("location");
+      if (!loc) return res;
+      current = new URL(loc, current).toString();
+      curOpts = {}; // リダイレクト先へはGETで辿る
+      continue;
+    }
+    return res;
+  }
+  throw new Error("リダイレクトが多すぎます（10回超）");
+}
+
+// ネストしたオブジェクトから指定キーを再帰的に探す（Auth0の設定JSONのネスト位置が
+// 分からないため、位置に依存せず値を拾えるようにしている）
+function findDeep(obj, key, depth = 0) {
+  if (depth > 6 || obj == null || typeof obj !== "object") return undefined;
+  if (key in obj) return obj[key];
+  for (const k of Object.keys(obj)) {
+    const found = findDeep(obj[k], key, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+// ログインページのHTMLから state / _csrf を抽出する。
+// Auth0 Lock系のページは base64エンコードしたJSON設定を window.atob(...) に埋め込むことが多いので
+// まずそれを試し、ダメなら生のHTML中の "state":"..." / "_csrf":"..." を直接拾う。
+function extractStateAndCsrf(html) {
+  let state, csrf;
+  const b64Match = html.match(/window\.atob\(['"]([^'"]+)['"]\)/);
+  if (b64Match) {
+    try {
+      const decoded = decodeURIComponent(escape(Buffer.from(b64Match[1], "base64").toString("binary")));
+      const cfg = JSON.parse(decoded);
+      state = findDeep(cfg, "state");
+      csrf = findDeep(cfg, "_csrf");
+    } catch (e) { /* フォールバックへ */ }
+  }
+  if (!state) { const m = html.match(/"state"\s*:\s*"([^"]+)"/); if (m) state = m[1]; }
+  if (!csrf) { const m = html.match(/"_csrf"\s*:\s*"([^"]+)"/); if (m) csrf = m[1]; }
+  return { state, csrf };
+}
+
+// HTML中の最初の<form>のaction先と、hidden inputの値を抜き出す
+// （/usernamepassword/login のレスポンスが「自動送信フォーム」だった場合の中継用）
+function extractFirstForm(html) {
+  const formMatch = html.match(/<form[^>]*action="([^"]*)"[^>]*>([\s\S]*?)<\/form>/i);
+  if (!formMatch) return null;
+  const action = formMatch[1];
+  const body = formMatch[2];
+  const inputs = {};
+  const inputRe = /<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/gi;
+  let m;
+  while ((m = inputRe.exec(body))) inputs[m[1]] = m[2];
+  return { action, inputs };
+}
+
+function saveDebugHtml(name, html) {
+  try {
+    fs.mkdirSync(OUT_DIR, { recursive: true });
+    fs.writeFileSync(path.join(OUT_DIR, name), html);
+    console.log(`デバッグ用に ${name} を保存しました`);
+  } catch (e) { /* noop */ }
+}
+
+// CAPCOM IDのメール・パスワードでHTTPのみでログインし、Cookie文字列を返す。
+async function httpLogin(email, password) {
+  const jar = new CookieJar();
+
+  console.log("ログイン起点へアクセス（リダイレクトを辿ります）");
+  const loginPageRes = await fetchFollow(
+    jar,
+    `https://www.streetfighter.com/6/buckler/${LOCALE}/auth/loginep?redirect_url=/`
+  );
+  const loginHtml = await loginPageRes.text();
+  const { state, csrf } = extractStateAndCsrf(loginHtml);
+  if (!state || !csrf) {
+    saveDebugHtml("debug-login-page.html", loginHtml);
+    throw new Error("ログインページから state/_csrf を抽出できませんでした（output/debug-login-page.html を確認してください）");
+  }
+  console.log("state/_csrf を取得しました");
+
+  const body = {
+    client_id: "mVxOARlAyTcJkcFAb8IZoiKYV8qGAH9a",
+    connection: "Username-Password-Authentication",
+    password,
+    popup_options: {},
+    protocol: "oauth2",
+    redirect_uri: "https://cid.capcom.com/ja/loginCallback",
+    response_type: "code",
+    scope: "openid profile email",
+    show_sing_up: "0",
+    sso: true,
+    state,
+    tenant: "capcom",
+    ui_locales: "ja",
+    username: email,
+    _csrf: csrf,
+    _intstate: "deprecated",
+  };
+
+  console.log("ユーザー名・パスワードを送信します");
+  let res = await fetch("https://auth.cid.capcom.com/usernamepassword/login", {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/json",
+      "Origin": "https://auth.cid.capcom.com",
+      "Referer": loginPageRes.url || "https://auth.cid.capcom.com/login",
+      Cookie: jar.header(),
+    },
+    body: JSON.stringify(body),
+    redirect: "manual",
+  });
+  jar.absorb(res);
+
+  // ケースA: 素直にリダイレクトが返ってくる場合
+  if (res.status >= 300 && res.status < 400) {
+    const loc = res.headers.get("location");
+    if (loc) {
+      res = await fetchFollow(jar, new URL(loc, res.url || "https://auth.cid.capcom.com").toString());
+    }
+  } else if (res.ok) {
+    // ケースB: Auth0特有の「自動送信フォームを含むHTML」が返ってくる場合
+    const html = await res.text();
+    const form = extractFirstForm(html);
+    if (!form) {
+      saveDebugHtml("debug-login-response.html", html);
+      throw new Error("ログイン後のレスポンスを解釈できませんでした（output/debug-login-response.html を確認してください）");
+    }
+    const formBody = new URLSearchParams(form.inputs).toString();
+    res = await fetchFollow(jar, new URL(form.action, "https://auth.cid.capcom.com").toString(), {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: formBody,
+    });
+  } else {
+    const errText = await res.text().catch(() => "");
+    saveDebugHtml("debug-login-error.html", errText);
+    throw new Error(`ログインに失敗しました（HTTP ${res.status}）。output/debug-login-error.html を確認してください。パスワードやフィールド名が変わった可能性があります。`);
+  }
+
+  // 最終的に streetfighter.com のドメインに戻ってきているか確認
+  const finalUrl = res.url || "";
+  if (!finalUrl.includes("streetfighter.com")) {
+    const html = await res.text().catch(() => "");
+    saveDebugHtml("debug-login-final.html", html);
+    throw new Error(`ログイン後の最終遷移先が streetfighter.com になっていません（${finalUrl}）。output/debug-login-final.html を確認してください。`);
+  }
+
+  console.log("ログイン成功。Cookieを取得しました。");
+  return jar.header();
+}
+
+/* ------------------------------------------------------------------------
+   ここから通常の戦績取得（既存のCookie方式ロジックはそのまま）
+   ------------------------------------------------------------------------ */
+
+let COOKIE = MANUAL_COOKIE;
+
+function authHeaders() {
+  return {
+    "Cookie": COOKIE,
+    "User-Agent": UA,
+    "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
+  };
+}
 
 // HTTPステータスに応じて処理を分ける汎用フェッチ。
 // 429/5xx系はしばらく待ってリトライ（最大3回）、401/403/404は即座に諦めて呼び出し元に伝える。
 async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const res = await fetch(url, { headers: HEADERS });
+    const res = await fetch(url, { headers: authHeaders() });
     if (res.ok) return res;
 
     if (res.status === 401) {
-      throw new Error("HTTP 401: 認証切れです。SF6_SESSION_COOKIE を取り直してSecretsを更新してください。");
+      throw new Error("HTTP 401: 認証切れです。Cookieが無効になっています。");
     }
     if (res.status === 403) {
       throw new Error("HTTP 403: アクセス拒否されました（Bot判定等）。連続で叩き続けると悪化する可能性があるため、ここで中断します。");
@@ -70,7 +274,6 @@ async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
       await sleep(waitMs);
       continue;
     }
-    // その他の予期しないエラー
     throw new Error(`HTTP ${res.status}: 予期しないエラー（${url}）`);
   }
 }
@@ -81,7 +284,6 @@ async function fetchText(url) {
 }
 
 // プロフィールページのHTMLから __NEXT_DATA__ に埋め込まれた buildId を取り出す。
-// buildIdはサイトのデプロイごとに変わるため毎回取得し直す。
 async function getBuildId() {
   const html = await fetchText(`https://www.streetfighter.com/6/buckler/${LOCALE}/profile/${FIGHTER_ID}`);
   const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -124,9 +326,7 @@ async function fetchExistingReplays() {
   }
 }
 
-// Gistの複数ファイルをまとめて更新する。GIST_IDが指定されていれば既存のGistを更新し、
-// なければ新規のsecret gistを作成する（その場合は次回以降のためにGIST_IDをSecretsへ
-// 追加登録する必要がある旨をログに出す）。
+// Gistの複数ファイルをまとめて更新する。
 async function uploadToGist(files) {
   const headers = {
     "Authorization": `Bearer ${GIST_TOKEN}`,
@@ -164,6 +364,12 @@ async function uploadToGist(files) {
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
+  if (EMAIL) {
+    COOKIE = await httpLogin(EMAIL, PASSWORD);
+  } else {
+    console.log("SF6_SESSION_COOKIE（手動Cookie）を使用します。");
+  }
+
   // 差分取得のため、先に既存データ（前回までの蓄積）を取得しておく
   console.log("既存のGistの中身を確認します。");
   const existingReplays = await fetchExistingReplays();
@@ -195,8 +401,6 @@ async function main() {
     console.log(`page ${p}: ${list.length}件 (total_page=${pp.total_page})`);
     allReplays.push(...list);
 
-    // このページの中身が全部既知のreplay_idだった＝それ以前のページも全部既知のはずなので、
-    // ここで打ち切る（無駄なリクエストを避ける差分取得）
     const allKnown = list.length > 0 && list.every((r) => existingIds.has(r.replay_id));
     if (allKnown) {
       console.log(`page ${p} は既知のデータのみでした。これ以降の取得を打ち切ります。`);
