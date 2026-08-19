@@ -1,9 +1,11 @@
 {
   "name": "sf6-battlelog-scraper",
   "private": true,
-  "version": "3.0.0",
-  "description": "Cookie方式でSF6の対戦履歴を取得しGistへ蓄積するスクリプト（依存パッケージなし）",
+  "version": "2.0.0",
   "scripts": {
     "scrape": "node scrape.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
   }
 }
