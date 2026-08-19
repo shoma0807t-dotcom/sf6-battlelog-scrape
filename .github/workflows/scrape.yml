@@ -3,12 +3,12 @@ name: Scrape SF6 battlelog
 on:
   workflow_dispatch: {}
   schedule:
+    # 毎日 21:00 JST（12:00 UTC）に自動実行。不要なら削除してOK。
     - cron: "0 12 * * *"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -16,28 +16,40 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package.json') }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Cache Playwright browser binary
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('package.json') }}
+
+      - name: Install Playwright browser (Chromium only)
+        run: npx playwright install --with-deps chromium
+
       - name: Run scraper
         env:
           CAPCOM_ID_EMAIL: ${{ secrets.CAPCOM_ID_EMAIL }}
           CAPCOM_ID_PASSWORD: ${{ secrets.CAPCOM_ID_PASSWORD }}
-          SF6_SESSION_COOKIE: ${{ secrets.SF6_SESSION_COOKIE }}
           SF6_FIGHTER_ID: ${{ secrets.SF6_FIGHTER_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: node scrape.js
 
-      - name: Show debug files
-        if: always()
-        run: |
-          echo "=== output directory ==="
-          ls -la output 2>/dev/null || echo "output does not exist"
-          echo "=== all files ==="
-          find . -maxdepth 4 -type f -print
-
-      - name: Upload debug artifacts
-        if: always()
+      - name: Upload debug artifacts on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-output
-          path: output/
-          if-no-files-found: warn
+          path: |
+            output/debug-last-page.png
+            output/debug-last-url.txt
+          if-no-files-found: ignore
