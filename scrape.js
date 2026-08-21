@@ -1,34 +1,44 @@
 // Buckler's Boot Camp（SF6公式サイト）内部APIから対戦履歴を直接取得し、
 // スト6攻略ノートアプリがそのままインポートできる形式でGistへアップロードする。
 //
-// v5: ログイン自動化（CAPCOM_ID_EMAIL/PASSWORD）を廃止し、SF6_SESSION_COOKIE方式のみに一本化。
-//     https://github.com/alanoliveira/sfbuff の「Cookie直指定フォールバック」方式に寄せた、
-//     最小構成版。
+// v6: got-scraping（HTTP-onlyのTLS/HTTP2フィンガープリント偽装）をやめ、
+//     Playwright（Chromiumヘッドレス）で「実ブラウザ」として動かす方式に変更。
+//     理由：Cloudflareの「JS実行を要求するインタラクティブチャレンジ」は、
+//     HTTPリクエストだけでは原理的に突破できない（TLS指紋をいくら偽装しても無関係）。
+//     実際にJSを実行できるブラウザで開けば、チャレンジは自動的に解決される。
+//     （参考: https://github.com/alanoliveira/sfbuff もHTTPクライアントが
+//      失敗した場合はSelenium+Chromiumにフォールバックしている）
 //
 // 流れ：
-// 1. Bucklerトップページ（/6/buckler/{locale}）をSF6_SESSION_COOKIE付きで取得
-// 2. レスポンスHTML中の __NEXT_DATA__ から buildId を抽出
-// 3. battlelog.json（page=1）を取得し、JSONとして解釈できるか確認
-//    　→ できない場合はCookie切れ（ログイン画面のHTMLが返ってきている）と判断して即終了
-// 4. page=1〜10を順に取得（既知のreplay_idしか無いページに当たったら打ち切り）
+// 1. SF6_SESSION_COOKIE をパースして、Playwrightのbrowser contextにCookieとして注入
+// 2. Bucklerトップページへ実際にブラウザで遷移（Cloudflareのチャレンジがあれば自動解決を待つ）
+// 3. ページ内のグローバル変数 window.__NEXT_DATA__ から buildId を取得
+// 4. battlelog.json（page=1〜10）を「ブラウザの中のfetch()」として叩く
+//    （cf_clearance等のセッションCookieがブラウザに保持されたまま送信されるため、
+//      素のHTTPリクエストより通りやすい）
 // 5. 既存Gistの中身と replay_id で突き合わせ、新規分だけ追加してGistを更新
 //
 // 必要な環境変数（GitHub Secrets経由で渡す想定）:
 //   SF6_SESSION_COOKIE   … ログイン済みブラウザからコピーしたCookie文字列（必須）
 //   SF6_FIGHTER_ID       … 自分のCFNプレイヤーID（プロフィールページURLの数字部分）
 //   SF6_LOCALE           … 省略時 "ja-jp"
-//   SF6_REQUEST_DELAY_MS … 省略時 400（各リクエストの間隔・レート制限対策）
+//   SF6_REQUEST_DELAY_MS … 省略時 800（各リクエストの間隔・レート制限対策）
 //   GIST_TOKEN           … Gist更新用のPersonal Access Token（gistスコープ）
 //   GIST_ID              … 更新先のGist ID
+//
+// 事前準備（package.json の postinstall、またはCIのステップで）:
+//   npx playwright install --with-deps chromium
 
 const fs = require("fs");
 const path = require("path");
+const { chromium } = require("playwright");
 
-const COOKIE = process.env.SF6_SESSION_COOKIE || "";
+const COOKIE_STRING = process.env.SF6_SESSION_COOKIE || "";
 const FIGHTER_ID = process.env.SF6_FIGHTER_ID || "";
 const LOCALE = process.env.SF6_LOCALE || "ja-jp";
-const REQUEST_DELAY_MS = parseInt(process.env.SF6_REQUEST_DELAY_MS || "400", 10);
+const REQUEST_DELAY_MS = parseInt(process.env.SF6_REQUEST_DELAY_MS || "800", 10);
 const MAX_PAGES = 10; // page=1〜10固定
+const NAV_TIMEOUT_MS = 45000;
 const OUT_DIR = path.join(__dirname, "output");
 
 const GIST_TOKEN = process.env.GIST_TOKEN || "";
@@ -36,132 +46,126 @@ const GIST_ID = process.env.GIST_ID || "";
 const GIST_FILENAME = "battlelog.json";
 const GIST_RAW_FILENAME = "battlelog-raw.json";
 
+const SITE_URL = "https://www.streetfighter.com";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-if (!COOKIE) { console.error("SF6_SESSION_COOKIE が設定されていません"); process.exit(1); }
+if (!COOKIE_STRING) { console.error("SF6_SESSION_COOKIE が設定されていません"); process.exit(1); }
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
 if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-// got-scraping はESM専用パッケージなので動的importで読み込む（初回のみ）。
-// TLS/HTTP2フィンガープリントを本物のブラウザに近づけ、Cloudflareの単純なbot判定を回避する。
-let _gotScraping = null;
-async function loadGotScraping() {
-  if (!_gotScraping) {
-    const mod = await import("got-scraping");
-    _gotScraping = mod.gotScraping;
-  }
-  return _gotScraping;
-}
-
-function authHeaders() {
-  return {
-    "Cookie": COOKIE,
-    "User-Agent": UA,
-    "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": `https://www.streetfighter.com/6/buckler/${LOCALE}/`,
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-  };
-}
-
-function saveDebugHtml(name, html) {
+function saveDebugFile(name, content) {
   try {
     fs.mkdirSync(OUT_DIR, { recursive: true });
-    fs.writeFileSync(path.join(OUT_DIR, name), html);
+    fs.writeFileSync(path.join(OUT_DIR, name), content);
     console.log(`デバッグ用に ${name} を保存しました`);
   } catch (e) { /* noop */ }
 }
 
-// HTTPステータスに応じて処理を分ける汎用フェッチ。
-// 429/5xx系はしばらく待ってリトライ（最大3回）、401/403/404は即座に諦めて呼び出し元に伝える。
-async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
-  const gotScraping = await loadGotScraping();
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    let res;
+async function saveDebugSnapshot(page, label) {
+  const stamp = Date.now();
+  try {
+    const html = await page.content();
+    saveDebugFile(`debug-${label}-${stamp}.html`, html);
+  } catch (e) { /* noop */ }
+  try {
+    await page.screenshot({ path: path.join(OUT_DIR, `debug-${label}-${stamp}.png`), fullPage: true });
+    console.log(`デバッグ用に debug-${label}-${stamp}.png を保存しました`);
+  } catch (e) { /* noop */ }
+}
+
+// "name1=value1; name2=value2" 形式の文字列を Playwright の addCookies 用配列にパースする。
+// README手順どおり streetfighter.com 宛リクエストの Cookie ヘッダーを丸ごとコピーした前提。
+function parseCookieString(str) {
+  return str
+    .split(";")
+    .map((pair) => pair.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const eq = pair.indexOf("=");
+      return {
+        name: pair.slice(0, eq).trim(),
+        value: pair.slice(eq + 1).trim(),
+        url: SITE_URL,
+      };
+    });
+}
+
+// Bucklerトップページへ遷移し、Cloudflareのチャレンジ（あれば）が解決して
+// 実際のNext.jsページ（window.__NEXT_DATA__）が現れるまで待つ。
+async function gotoAndWaitForNextData(page, url, label) {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  try {
+    await page.waitForFunction(() => !!window.__NEXT_DATA__, { timeout: NAV_TIMEOUT_MS });
+  } catch (e) {
+    await saveDebugSnapshot(page, label);
+    throw new Error(`ページの読み込みがタイムアウトしました（Cloudflareのチャレンジで止まっている、またはCookieが無効な可能性。output/debug-${label}-*.html/.png を確認してください）`);
+  }
+}
+
+async function getBuildId(page) {
+  console.log("Bucklerトップページを開きます。");
+  await gotoAndWaitForNextData(page, `${SITE_URL}/6/buckler/${LOCALE}`, "top");
+  const buildId = await page.evaluate(() => window.__NEXT_DATA__ && window.__NEXT_DATA__.buildId);
+  if (!buildId) {
+    await saveDebugSnapshot(page, "top-no-buildid");
+    throw new Error("buildId が取得できませんでした");
+  }
+  return buildId;
+}
+
+// battlelog.json をブラウザ内の fetch() として叩く（cf_clearance等のCookieがそのまま使われる）。
+async function fetchBattlelogPageOnce(page, buildId, pageNum) {
+  const url = `${SITE_URL}/6/buckler/_next/data/${buildId}/${LOCALE}/profile/${FIGHTER_ID}/battlelog.json?page=${pageNum}&sid=${FIGHTER_ID}`;
+  const result = await page.evaluate(async (u) => {
     try {
-      res = await gotScraping({
-        url,
-        headers: authHeaders(),
-        throwHttpErrors: false,
-        timeout: { request: 30000 },
-        headerGeneratorOptions: undefined,
+      const res = await fetch(u, {
+        headers: { "x-nextjs-data": "1", "Accept": "application/json, text/plain, */*" },
       });
+      const text = await res.text();
+      return { ok: true, status: res.status, text };
     } catch (e) {
-      if (attempt === maxRetries) throw new Error(`ネットワークエラー: ${e.message}（${url}）`);
+      return { ok: false, error: String(e) };
+    }
+  }, url);
+
+  if (!result.ok) throw new Error(`ネットワークエラー: ${result.error}（page ${pageNum}）`);
+
+  if (result.status === 401) throw { retryable: false, message: `HTTP 401: 認証切れです。SF6_SESSION_COOKIE が無効になっています（page ${pageNum}）。` };
+  if (result.status === 403) throw { retryable: true, message: `HTTP 403: アクセス拒否されました（page ${pageNum}）。` };
+  if (result.status === 404) throw { retryable: false, message: `HTTP 404: ${url} が見つかりませんでした（page ${pageNum}）。` };
+  if (result.status === 429 || result.status >= 500) throw { retryable: true, message: `HTTP ${result.status}（page ${pageNum}）。` };
+  if (result.status < 200 || result.status >= 300) throw { retryable: false, message: `HTTP ${result.status}: 予期しないエラー（page ${pageNum}）。` };
+
+  try {
+    return JSON.parse(result.text);
+  } catch (e) {
+    throw { retryable: true, message: `page ${pageNum}: JSONではないレスポンスが返ってきました（チャレンジ画面の可能性）。`, notJson: true };
+  }
+}
+
+async function fetchBattlelogPage(page, buildId, pageNum, { maxRetries = 3 } = {}) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fetchBattlelogPageOnce(page, buildId, pageNum);
+    } catch (e) {
+      const retryable = typeof e === "object" && e !== null && "retryable" in e ? e.retryable : false;
+      const message = typeof e === "object" && e !== null && "message" in e ? e.message : String(e);
+
+      if (!retryable || attempt === maxRetries) {
+        await saveDebugSnapshot(page, `battlelog-page${pageNum}`);
+        throw new Error(`${message}（output/debug-battlelog-page${pageNum}-*.html/.png を確認してください）`);
+      }
       const waitMs = 1000 * Math.pow(2, attempt);
-      console.warn(`通信エラー（${e.message}）。${waitMs}ms待ってリトライします（${attempt + 1}/${maxRetries}）`);
+      console.warn(`${message} ${waitMs}ms待ってリトライします（${attempt + 1}/${maxRetries}）`);
       await sleep(waitMs);
-      continue;
+      // チャレンジで弾かれた可能性があるので、リトライ前にトップページを踏み直してセッションを温め直す
+      if (e && e.notJson) {
+        try { await gotoAndWaitForNextData(page, `${SITE_URL}/6/buckler/${LOCALE}`, `retry-top-page${pageNum}`); } catch (_) { /* 次のリトライへ */ }
+      }
     }
-    if (res.statusCode >= 200 && res.statusCode < 300) return res;
-
-    if (res.statusCode === 401) {
-      throw new Error("HTTP 401: 認証切れです。SF6_SESSION_COOKIE が無効になっています。再取得して登録し直してください。");
-    }
-    if (res.statusCode === 403) {
-      throw new Error("HTTP 403: アクセス拒否されました（Bot判定等）。連続で叩き続けると悪化する可能性があるため、ここで中断します。");
-    }
-    if (res.statusCode === 404) {
-      throw new Error(`HTTP 404: ${url} が見つかりませんでした（URLの形式が変わった可能性があります）。`);
-    }
-    if (res.statusCode === 429 || res.statusCode >= 500) {
-      if (attempt === maxRetries) throw new Error(`HTTP ${res.statusCode}: リトライ上限に達しました（${url}）`);
-      const waitMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s...
-      console.warn(`HTTP ${res.statusCode} を受け取りました。${waitMs}ms待ってリトライします（${attempt + 1}/${maxRetries}）`);
-      await sleep(waitMs);
-      continue;
-    }
-    throw new Error(`HTTP ${res.statusCode}: 予期しないエラー（${url}）`);
   }
-}
-
-async function fetchText(url) {
-  const res = await fetchWithRetry(url);
-  return res.body;
-}
-
-// 1. Bucklerトップページを取得し、2. __NEXT_DATA__ から buildId を抽出する。
-async function getBuildIdFromTop() {
-  console.log("Bucklerトップページを取得します。");
-  const html = await fetchText(`https://www.streetfighter.com/6/buckler/${LOCALE}`);
-  const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (!m) {
-    saveDebugHtml("debug-top.html", html);
-    throw new Error("__NEXT_DATA__ が見つかりませんでした（Cookieが無効、またはページ構造が変わった可能性があります。output/debug-top.html を確認してください）");
-  }
-  let data;
-  try {
-    data = JSON.parse(m[1]);
-  } catch (e) {
-    saveDebugHtml("debug-top.html", html);
-    throw new Error("__NEXT_DATA__ のJSONパースに失敗しました（output/debug-top.html を確認してください）");
-  }
-  if (!data.buildId) throw new Error("buildId が取得できませんでした");
-  return data.buildId;
-}
-
-// 3. battlelog.json（page指定）を取得し、JSONとして返ってきているか確認する。
-//    Cookie切れ等でログイン画面（HTML）が返ってきた場合はここで検知する。
-async function fetchBattlelogPage(buildId, page) {
-  const url = `https://www.streetfighter.com/6/buckler/_next/data/${buildId}/${LOCALE}/profile/${FIGHTER_ID}/battlelog.json?page=${page}&sid=${FIGHTER_ID}`;
-  const text = await fetchText(url);
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    saveDebugHtml(`debug-battlelog-page${page}.html`, text);
-    throw new Error(`page ${page}: JSONではないレスポンスが返ってきました（Cookie切れの可能性。output/debug-battlelog-page${page}.html を確認してください）`);
-  }
-  return data;
 }
 
 // 既存Gistの中身（前回までに蓄積した対戦履歴・data側）を取得する。
@@ -229,46 +233,57 @@ async function uploadToGist(files) {
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
-  console.log("SF6_SESSION_COOKIE を使用します。");
-
   // 差分取得のため、先に既存データ（前回までの蓄積）を取得しておく
   console.log("既存のGistの中身を確認します。");
   const existingReplays = await fetchExistingReplays();
   const existingIds = new Set(existingReplays.map((r) => r.replay_id));
   console.log(`既存: ${existingReplays.length}件`);
 
-  const buildId = await getBuildIdFromTop();
-  console.log("buildId:", buildId);
-
+  const browser = await chromium.launch({ headless: true });
+  let allReplays = [];
+  let rawPages = [];
   let fighterBannerInfo = null;
-  const allReplays = [];
-  const rawPages = [];
 
-  for (let p = 1; p <= MAX_PAGES; p++) {
-    if (p > 1) await sleep(REQUEST_DELAY_MS); // レート制限対策：リクエスト間隔を空ける
+  try {
+    const context = await browser.newContext({
+      userAgent: UA,
+      locale: "ja-JP",
+      viewport: { width: 1280, height: 800 },
+    });
+    await context.addCookies(parseCookieString(COOKIE_STRING));
+    const page = await context.newPage();
 
-    let data;
-    try {
-      data = await fetchBattlelogPage(buildId, p);
-    } catch (e) {
-      console.warn(`page ${p} の取得を中断します:`, e.message);
-      break;
+    const buildId = await getBuildId(page);
+    console.log("buildId:", buildId);
+
+    for (let p = 1; p <= MAX_PAGES; p++) {
+      if (p > 1) await sleep(REQUEST_DELAY_MS); // レート制限対策：リクエスト間隔を空ける
+
+      let data;
+      try {
+        data = await fetchBattlelogPage(page, buildId, p);
+      } catch (e) {
+        console.warn(`page ${p} の取得を中断します:`, e.message);
+        break;
+      }
+      console.log(`page ${p}: JSON取得OK`);
+      rawPages.push({ page: p, fetched_at: new Date().toISOString(), data });
+
+      const pp = data.pageProps || {};
+      if (!fighterBannerInfo) fighterBannerInfo = pp.fighter_banner_info;
+      const list = pp.replay_list || [];
+      console.log(`page ${p}: ${list.length}件 (total_page=${pp.total_page})`);
+      allReplays.push(...list);
+
+      const allKnown = list.length > 0 && list.every((r) => existingIds.has(r.replay_id));
+      if (allKnown) {
+        console.log(`page ${p} は既知のデータのみでした。これ以降の取得を打ち切ります。`);
+        break;
+      }
+      if (!list.length || (pp.total_page && p >= pp.total_page)) break;
     }
-    console.log(`page ${p}: JSON取得OK`);
-    rawPages.push({ page: p, fetched_at: new Date().toISOString(), data });
-
-    const pp = data.pageProps || {};
-    if (!fighterBannerInfo) fighterBannerInfo = pp.fighter_banner_info;
-    const list = pp.replay_list || [];
-    console.log(`page ${p}: ${list.length}件 (total_page=${pp.total_page})`);
-    allReplays.push(...list);
-
-    const allKnown = list.length > 0 && list.every((r) => existingIds.has(r.replay_id));
-    if (allKnown) {
-      console.log(`page ${p} は既知のデータのみでした。これ以降の取得を打ち切ります。`);
-      break;
-    }
-    if (!list.length || (pp.total_page && p >= pp.total_page)) break;
+  } finally {
+    await browser.close();
   }
 
   console.log(`今回の取得: ${allReplays.length}件`);

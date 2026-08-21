@@ -1,12 +1,12 @@
 {
   "name": "sf6-battlelog-scraper",
   "private": true,
-  "version": "5.0.0",
-  "description": "SF6_SESSION_COOKIE方式＋got-scraping（TLS/HTTP2フィンガープリント偽装）でSF6の対戦履歴を取得しGistへ蓄積するスクリプト",
+  "version": "6.0.0",
+  "description": "SF6_SESSION_COOKIE方式＋Playwright（Chromiumヘッドレス）でSF6の対戦履歴を取得しGistへ蓄積するスクリプト",
   "scripts": {
     "scrape": "node scrape.js"
   },
   "dependencies": {
-    "got-scraping": "^4.0.6"
+    "playwright": "^1.47.0"
   }
 }
