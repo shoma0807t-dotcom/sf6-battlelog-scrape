@@ -44,4 +44,5 @@ jobs:
           path: |
             output/debug-*.html
             output/debug-*.png
+            output/debug-*.txt
           if-no-files-found: ignore
