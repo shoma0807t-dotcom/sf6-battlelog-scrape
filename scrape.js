@@ -124,7 +124,9 @@ async function fetchBattlelogPageOnce(page, buildId, pageNum) {
         headers: { "x-nextjs-data": "1", "Accept": "application/json, text/plain, */*" },
       });
       const text = await res.text();
-      return { ok: true, status: res.status, text };
+      const headers = {};
+      res.headers.forEach((v, k) => { headers[k] = v; });
+      return { ok: true, status: res.status, text, headers };
     } catch (e) {
       return { ok: false, error: String(e) };
     }
@@ -132,16 +134,32 @@ async function fetchBattlelogPageOnce(page, buildId, pageNum) {
 
   if (!result.ok) throw new Error(`ネットワークエラー: ${result.error}（page ${pageNum}）`);
 
-  if (result.status === 401) throw { retryable: false, message: `HTTP 401: 認証切れです。SF6_SESSION_COOKIE が無効になっています（page ${pageNum}）。` };
-  if (result.status === 403) throw { retryable: true, message: `HTTP 403: アクセス拒否されました（page ${pageNum}）。` };
-  if (result.status === 404) throw { retryable: false, message: `HTTP 404: ${url} が見つかりませんでした（page ${pageNum}）。` };
-  if (result.status === 429 || result.status >= 500) throw { retryable: true, message: `HTTP ${result.status}（page ${pageNum}）。` };
-  if (result.status < 200 || result.status >= 300) throw { retryable: false, message: `HTTP ${result.status}: 予期しないエラー（page ${pageNum}）。` };
+  // エラー時に実際に何が返ってきたかを保存できるよう、常に生データを持たせておく
+  const responseDump = [
+    `URL: ${url}`,
+    `Status: ${result.status}`,
+    `cf-ray: ${result.headers["cf-ray"] || "(なし)"}`,
+    `cf-mitigated: ${result.headers["cf-mitigated"] || "(なし)"}`,
+    `content-type: ${result.headers["content-type"] || "(なし)"}`,
+    `server: ${result.headers["server"] || "(なし)"}`,
+    "",
+    "----- body -----",
+    result.text || "(空)",
+  ].join("\n");
+
+  if (result.status !== 200) {
+    const err = { responseDump };
+    if (result.status === 401) throw Object.assign(err, { retryable: false, message: `HTTP 401: 認証切れです。SF6_SESSION_COOKIE が無効になっています（page ${pageNum}）。` });
+    if (result.status === 403) throw Object.assign(err, { retryable: true, message: `HTTP 403: アクセス拒否されました（page ${pageNum}）。` });
+    if (result.status === 404) throw Object.assign(err, { retryable: false, message: `HTTP 404: ${url} が見つかりませんでした（page ${pageNum}）。` });
+    if (result.status === 429 || result.status >= 500) throw Object.assign(err, { retryable: true, message: `HTTP ${result.status}（page ${pageNum}）。` });
+    throw Object.assign(err, { retryable: false, message: `HTTP ${result.status}: 予期しないエラー（page ${pageNum}）。` });
+  }
 
   try {
     return JSON.parse(result.text);
   } catch (e) {
-    throw { retryable: true, message: `page ${pageNum}: JSONではないレスポンスが返ってきました（チャレンジ画面の可能性）。`, notJson: true };
+    throw { retryable: true, message: `page ${pageNum}: JSONではないレスポンスが返ってきました（チャレンジ画面の可能性）。`, notJson: true, responseDump };
   }
 }
 
@@ -152,10 +170,14 @@ async function fetchBattlelogPage(page, buildId, pageNum, { maxRetries = 3 } = {
     } catch (e) {
       const retryable = typeof e === "object" && e !== null && "retryable" in e ? e.retryable : false;
       const message = typeof e === "object" && e !== null && "message" in e ? e.message : String(e);
+      const responseDump = typeof e === "object" && e !== null ? e.responseDump : undefined;
 
       if (!retryable || attempt === maxRetries) {
-        await saveDebugSnapshot(page, `battlelog-page${pageNum}`);
-        throw new Error(`${message}（output/debug-battlelog-page${pageNum}-*.html/.png を確認してください）`);
+        if (responseDump) {
+          saveDebugFile(`debug-battlelog-page${pageNum}-response-${Date.now()}.txt`, responseDump);
+        }
+        await saveDebugSnapshot(page, `battlelog-page${pageNum}-pagestate`);
+        throw new Error(`${message}（output/debug-battlelog-page${pageNum}-response-*.txt を確認してください。page-state系のhtml/pngは実際のAPIレスポンスではなく、その時点のブラウザ画面です）`);
       }
       const waitMs = 1000 * Math.pow(2, attempt);
       console.warn(`${message} ${waitMs}ms待ってリトライします（${attempt + 1}/${maxRetries}）`);
