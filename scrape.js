@@ -1,47 +1,34 @@
 // Buckler's Boot Camp（SF6公式サイト）内部APIから対戦履歴を直接取得し、
 // スト6攻略ノートアプリがそのままインポートできる形式でGistへアップロードする。
 //
-// v6: got-scraping（HTTP-onlyのTLS/HTTP2フィンガープリント偽装）をやめ、
-//     Playwright（Chromiumヘッドレス）で「実ブラウザ」として動かす方式に変更。
-//     理由：Cloudflareの「JS実行を要求するインタラクティブチャレンジ」は、
-//     HTTPリクエストだけでは原理的に突破できない（TLS指紋をいくら偽装しても無関係）。
-//     実際にJSを実行できるブラウザで開けば、チャレンジは自動的に解決される。
-//     （参考: https://github.com/alanoliveira/sfbuff もHTTPクライアントが
-//      失敗した場合はSelenium+Chromiumにフォールバックしている）
-//
-// 流れ：
-// 1. SF6_SESSION_COOKIE をパースして、Playwrightのbrowser contextにCookieとして注入
-// 2. Bucklerトップページへ実際にブラウザで遷移（Cloudflareのチャレンジがあれば自動解決を待つ）
-// 3. ページ内のグローバル変数 window.__NEXT_DATA__ から buildId を取得
-// 4. battlelog.json（page=1〜10）を「ブラウザの中のfetch()」として叩く
-//    （cf_clearance等のセッションCookieがブラウザに保持されたまま送信されるため、
-//      素のHTTPリクエストより通りやすい）
-// 5. 既存Gistの中身と replay_id で突き合わせ、新規分だけ追加してGistを更新
+// v7: ブラウザ自動操作をPlaywrightからSelenium WebDriverに置き換え。
+//     流れは3段階：
+//       1. SF6_SESSION_COOKIE を注入して battlelog.json を試す
+//       2. ダメだった場合、CAPCOM_ID_EMAIL/PASSWORD があればログインフォームへの
+//          入力・送信を試す（※ログインページにCloudflare Turnstileのチェック
+//          ボックスが出た場合、それを自動で解く処理は一切実装しない。検知したら
+//          即座にエラーとして報告し、そこで止まる）
+//       3. ログインが成功していれば（streetfighter.comに戻ってきていれば）、
+//          そのセッションのCookieを取得し直して 1. をもう一度試す
 //
 // 必要な環境変数（GitHub Secrets経由で渡す想定）:
 //   SF6_SESSION_COOKIE   … ログイン済みブラウザからコピーしたCookie文字列
-//   CAPCOM_ID_EMAIL      … CAPCOM IDのログインメールアドレス（未設定ならCookie方式を使う）
-//   CAPCOM_ID_PASSWORD   … CAPCOM IDのログインパスワード（EMAILとセットで必須）
+//   CAPCOM_ID_EMAIL      … CAPCOM IDのログインメールアドレス（任意）
+//   CAPCOM_ID_PASSWORD   … CAPCOM IDのログインパスワード（EMAILとセットで使用）
 //   SF6_FIGHTER_ID       … 自分のCFNプレイヤーID（プロフィールページURLの数字部分）
 //   SF6_LOCALE           … 省略時 "ja-jp"
 //   SF6_REQUEST_DELAY_MS … 省略時 800（各リクエストの間隔・レート制限対策）
 //   GIST_TOKEN           … Gist更新用のPersonal Access Token（gistスコープ）
 //   GIST_ID              … 更新先のGist ID
 //
-// ログイン方式の優先順位：
-//   ① CAPCOM_ID_EMAIL / CAPCOM_ID_PASSWORD が設定されていれば、毎回ブラウザでログインし直す
-//     （Cookieの手動更新が不要になる。以前のHTTP-onlyログインが失敗していたのは
-//      JS実行が必要なインタラクティブチャレンジが原因だったが、Playwrightは実ブラウザなので
-//      理論上は通るはず。ただしCAPCOM ID側のログインフォームの正確なDOM構造は未検証なので、
-//      うまくいかない場合は output/debug-login-*.html/.png を見ながら調整が必要）
-//   ② ①が無ければ SF6_SESSION_COOKIE を使う（従来通り、手動更新が必要）
-//
-// 事前準備（package.json の postinstall、またはCIのステップで）:
-//   npx playwright install --with-deps chromium
+// 事前準備（CIのステップで）:
+//   Chrome本体とバージョンの合ったchromedriverをPATHに用意しておくこと
+//   （scrape.yml では browser-actions/setup-chrome + nanasess/setup-chromedriver を使用）
 
 const fs = require("fs");
 const path = require("path");
-const { chromium } = require("playwright");
+const { Builder, By } = require("selenium-webdriver");
+const chrome = require("selenium-webdriver/chrome");
 
 const COOKIE_STRING = process.env.SF6_SESSION_COOKIE || "";
 const EMAIL = process.env.CAPCOM_ID_EMAIL || "";
@@ -59,9 +46,10 @@ const GIST_FILENAME = "battlelog.json";
 const GIST_RAW_FILENAME = "battlelog-raw.json";
 
 const SITE_URL = "https://www.streetfighter.com";
+const SITE_HOST = "www.streetfighter.com";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-if (!EMAIL && !COOKIE_STRING) { console.error("CAPCOM_ID_EMAIL/CAPCOM_ID_PASSWORD か SF6_SESSION_COOKIE のいずれかが必要です"); process.exit(1); }
+if (!COOKIE_STRING && !EMAIL) { console.error("SF6_SESSION_COOKIE か CAPCOM_ID_EMAIL のいずれかが必要です"); process.exit(1); }
 if (EMAIL && !PASSWORD) { console.error("CAPCOM_ID_EMAIL はあるが CAPCOM_ID_PASSWORD がありません"); process.exit(1); }
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
 if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
@@ -76,20 +64,21 @@ function saveDebugFile(name, content) {
   } catch (e) { /* noop */ }
 }
 
-async function saveDebugSnapshot(page, label) {
+async function saveDebugSnapshot(driver, label) {
   const stamp = Date.now();
   try {
-    const html = await page.content();
+    const html = await driver.getPageSource();
     saveDebugFile(`debug-${label}-${stamp}.html`, html);
   } catch (e) { /* noop */ }
   try {
-    await page.screenshot({ path: path.join(OUT_DIR, `debug-${label}-${stamp}.png`), fullPage: true });
+    const png = await driver.takeScreenshot();
+    fs.mkdirSync(OUT_DIR, { recursive: true });
+    fs.writeFileSync(path.join(OUT_DIR, `debug-${label}-${stamp}.png`), png, "base64");
     console.log(`デバッグ用に debug-${label}-${stamp}.png を保存しました`);
   } catch (e) { /* noop */ }
 }
 
-// "name1=value1; name2=value2" 形式の文字列を Playwright の addCookies 用配列にパースする。
-// README手順どおり streetfighter.com 宛リクエストの Cookie ヘッダーを丸ごとコピーした前提。
+// "name1=value1; name2=value2" 形式の文字列をパースする。
 function parseCookieString(str) {
   return str
     .split(";")
@@ -97,36 +86,99 @@ function parseCookieString(str) {
     .filter(Boolean)
     .map((pair) => {
       const eq = pair.indexOf("=");
-      return {
-        name: pair.slice(0, eq).trim(),
-        value: pair.slice(eq + 1).trim(),
-        url: SITE_URL,
-      };
+      return { name: pair.slice(0, eq).trim(), value: pair.slice(eq + 1).trim() };
     });
 }
 
-// Bucklerトップページへ遷移し、Cloudflareのチャレンジ（あれば）が解決して
-// 実際のNext.jsページ（window.__NEXT_DATA__）が現れるまで待つ。
-async function gotoAndWaitForNextData(page, url, label) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-  try {
-    await page.waitForFunction(() => !!window.__NEXT_DATA__, { timeout: NAV_TIMEOUT_MS });
-  } catch (e) {
-    await saveDebugSnapshot(page, label);
-    throw new Error(`ページの読み込みがタイムアウトしました（Cloudflareのチャレンジで止まっている、またはCookieが無効な可能性。output/debug-${label}-*.html/.png を確認してください）`);
+async function buildDriver() {
+  const options = new chrome.Options();
+  options.addArguments(
+    "--headless=new",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--window-size=1280,800",
+    `--user-agent=${UA}`,
+    "--lang=ja-JP",
+    "--disable-blink-features=AutomationControlled"
+  );
+  options.excludeSwitches("enable-automation");
+  const driver = await new Builder().forBrowser("chrome").setChromeOptions(options).build();
+  await driver.manage().setTimeouts({ script: 30000, pageLoad: NAV_TIMEOUT_MS });
+  return driver;
+}
+
+// Cookie文字列をブラウザに注入する。Seleniumは「今開いているページと同じドメイン」の
+// Cookieしか追加できないため、先に対象ドメインへ一度アクセスしてから注入する。
+async function injectCookies(driver, cookieString) {
+  await driver.get(`${SITE_URL}/6/buckler/${LOCALE}`);
+  for (const c of parseCookieString(cookieString)) {
+    try {
+      await driver.manage().addCookie({ name: c.name, value: c.value, domain: SITE_HOST, path: "/" });
+    } catch (e) {
+      console.warn(`Cookie "${c.name}" の追加に失敗しました: ${e.message}`);
+    }
   }
 }
 
-// 複数の候補セレクタから、実際に表示されている最初の要素を返す。
-// CAPCOM IDのログインフォームの正確なDOM構造が未検証なため、よくあるパターンを
-// 複数試す形にしている。全滅した場合はデバッグ用スナップショットを見て調整する。
-async function findFirstVisible(page, selectors, timeoutMs = 8000) {
+// ページ内のグローバル変数 window.__NEXT_DATA__ が現れるまで待つ
+// （＝Next.jsアプリとして正常にレンダリングされた状態）。
+async function waitForNextData(driver, label, timeoutMs = NAV_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const has = await driver.executeScript("return !!window.__NEXT_DATA__;").catch(() => false);
+    if (has) return true;
+    await sleep(500);
+  }
+  await saveDebugSnapshot(driver, label);
+  return false;
+}
+
+async function getBuildId(driver) {
+  console.log("Bucklerトップページを開きます。");
+  await driver.get(`${SITE_URL}/6/buckler/${LOCALE}`);
+  const ok = await waitForNextData(driver, "top-timeout");
+  if (!ok) throw new Error("ページの読み込みがタイムアウトしました（output/debug-top-timeout-*.html/.png を確認してください）");
+  const buildId = await driver.executeScript("return window.__NEXT_DATA__ && window.__NEXT_DATA__.buildId;");
+  if (!buildId) {
+    await saveDebugSnapshot(driver, "top-no-buildid");
+    throw new Error("buildId が取得できませんでした");
+  }
+  return buildId;
+}
+
+// 現在のページがCloudflare Turnstile等のチャレンジ画面かどうかを判定する。
+// 突破は一切試みない。検知したらそのまま呼び出し元にエラーを返すためだけの関数。
+async function isChallengePage(driver) {
+  try {
+    const title = await driver.getTitle();
+    if (/just a moment/i.test(title)) return true;
+    const html = await driver.getPageSource();
+    if (/challenges\.cloudflare\.com/i.test(html) || /cf-turnstile/i.test(html) || /cType:\s*'managed'/i.test(html)) return true;
+  } catch (e) { /* noop */ }
+  return false;
+}
+
+const USERNAME_SELECTORS = [
+  'input[name="username"]', 'input[name="email"]',
+  "input#username", "input#email",
+  'input[type="email"]', 'input[autocomplete="username"]',
+];
+const PASSWORD_SELECTORS = [
+  'input[name="password"]', "input#password",
+  'input[type="password"]', 'input[autocomplete="current-password"]',
+];
+const SUBMIT_SELECTORS = [
+  'button[type="submit"]', 'button[name="action"]', 'input[type="submit"]',
+];
+
+async function findFirstVisible(driver, selectors, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     for (const sel of selectors) {
-      const loc = page.locator(sel).first();
       try {
-        if (await loc.isVisible({ timeout: 300 })) return loc;
+        const el = await driver.findElement(By.css(sel));
+        if (await el.isDisplayed()) return el;
       } catch (e) { /* この候補は無し、次へ */ }
     }
     await sleep(300);
@@ -134,128 +186,88 @@ async function findFirstVisible(page, selectors, timeoutMs = 8000) {
   return null;
 }
 
-const USERNAME_SELECTORS = [
-  'input[name="username"]',
-  'input[name="email"]',
-  'input#username',
-  'input#email',
-  'input[type="email"]',
-  'input[autocomplete="username"]',
-];
-const PASSWORD_SELECTORS = [
-  'input[name="password"]',
-  'input#password',
-  'input[type="password"]',
-  'input[autocomplete="current-password"]',
-];
-const SUBMIT_SELECTORS = [
-  'button[type="submit"]',
-  'button[name="action"]',
-  'button:has-text("ログイン")',
-  'button:has-text("Log in")',
-  'button:has-text("Log In")',
-  'button:has-text("Continue")',
-  'button:has-text("続ける")',
-  'input[type="submit"]',
-];
+// CAPCOM IDへのログインを試みる。Turnstile等のチャレンジが出た場合は
+// 突破を試みず、その場で検知してエラーにする。
+async function loginWithCredentials(driver) {
+  console.log("CAPCOM IDでログインを試みます。");
+  await driver.get(`${SITE_URL}/6/buckler/${LOCALE}/auth/loginep?redirect_url=/6/buckler/${LOCALE}`);
+  await saveDebugSnapshot(driver, "login-step1-loaded");
 
-// CAPCOM IDでログインし、streetfighter.com側の認証Cookieをブラウザcontextに獲得させる。
-// フォームが「メール+パスワードが同じ画面」なのか「メール→次画面でパスワード」の
-// 2段階なのかが事前に分からないため、両方に対応できるようにしている。
-async function loginWithCredentials(page) {
-  console.log("CAPCOM IDでログインします。");
-  await page.goto(`${SITE_URL}/6/buckler/${LOCALE}/auth/loginep?redirect_url=/6/buckler/${LOCALE}`, {
-    waitUntil: "domcontentloaded",
-    timeout: NAV_TIMEOUT_MS,
-  });
-  await saveDebugSnapshot(page, "login-step1-loaded");
+  if (await isChallengePage(driver)) {
+    throw new Error("ログインページでCloudflare Turnstile等のチャレンジが検出されました。自動では突破しません。手動でCookieを取得する方式に切り替えてください（output/debug-login-step1-loaded-*.html/.png を確認してください）。");
+  }
 
-  const usernameField = await findFirstVisible(page, USERNAME_SELECTORS);
+  const usernameField = await findFirstVisible(driver, USERNAME_SELECTORS);
   if (!usernameField) {
-    await saveDebugSnapshot(page, "login-no-username-field");
+    await saveDebugSnapshot(driver, "login-no-username-field");
     throw new Error("ログインフォームのメール/ユーザー名欄が見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
   }
-  await usernameField.fill(EMAIL);
+  await usernameField.sendKeys(EMAIL);
 
-  // 同一画面にパスワード欄も既にあるか確認（Auth0 Lock系＝1画面完結パターン）
-  let passwordField = await findFirstVisible(page, PASSWORD_SELECTORS, 1500);
-
+  let passwordField = await findFirstVisible(driver, PASSWORD_SELECTORS, 1500);
   if (!passwordField) {
-    // 無ければ「次へ」的なボタンを押して2画面目（パスワード入力）に進む
-    const nextButton = await findFirstVisible(page, SUBMIT_SELECTORS);
+    const nextButton = await findFirstVisible(driver, SUBMIT_SELECTORS);
     if (!nextButton) {
-      await saveDebugSnapshot(page, "login-no-next-button");
+      await saveDebugSnapshot(driver, "login-no-next-button");
       throw new Error("メール入力後の「次へ」ボタンが見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
     }
     await nextButton.click();
-    await saveDebugSnapshot(page, "login-step2-after-username-submit");
-    passwordField = await findFirstVisible(page, PASSWORD_SELECTORS);
-  }
+    await saveDebugSnapshot(driver, "login-step2-after-username-submit");
 
+    if (await isChallengePage(driver)) {
+      throw new Error("メール送信後にCloudflare Turnstile等のチャレンジが検出されました。自動では突破しません（output/debug-login-step2-*.html/.png を確認してください）。");
+    }
+    passwordField = await findFirstVisible(driver, PASSWORD_SELECTORS);
+  }
   if (!passwordField) {
-    await saveDebugSnapshot(page, "login-no-password-field");
+    await saveDebugSnapshot(driver, "login-no-password-field");
     throw new Error("ログインフォームのパスワード欄が見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
   }
-  await passwordField.fill(PASSWORD);
+  await passwordField.sendKeys(PASSWORD);
 
-  const loginButton = await findFirstVisible(page, SUBMIT_SELECTORS);
+  const loginButton = await findFirstVisible(driver, SUBMIT_SELECTORS);
   if (!loginButton) {
-    await saveDebugSnapshot(page, "login-no-submit-button");
+    await saveDebugSnapshot(driver, "login-no-submit-button");
     throw new Error("ログインボタンが見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
   }
+  await loginButton.click();
+  await sleep(2000);
+  await saveDebugSnapshot(driver, "login-result");
 
-  await Promise.all([
-    page.waitForURL((u) => u.hostname.includes("streetfighter.com"), { timeout: NAV_TIMEOUT_MS }).catch(() => {}),
-    loginButton.click(),
-  ]);
-  await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => {});
-  await saveDebugSnapshot(page, "login-result");
+  if (await isChallengePage(driver)) {
+    throw new Error("ログイン送信後にCloudflare Turnstile等のチャレンジが検出されました。自動では突破しません（output/debug-login-result-*.html/.png を確認してください）。");
+  }
 
-  const url = page.url();
-  if (!url.includes("streetfighter.com")) {
-    throw new Error(`ログイン後にstreetfighter.comへ戻ってきませんでした（現在のURL: ${url}）。メールアドレス/パスワードが誤っている、もしくは追加の確認（2段階認証等）が必要な可能性があります。output/debug-login-result-*.html/.png を確認してください。`);
+  const url = await driver.getCurrentUrl();
+  if (!url.includes(SITE_HOST)) {
+    throw new Error(`ログイン後にstreetfighter.comへ戻ってきませんでした（現在のURL: ${url}）。メールアドレス/パスワードが誤っている可能性があります（output/debug-login-result-*.html/.png を確認してください）。`);
   }
   console.log("ログインに成功したとみられます。streetfighter.com に戻りました。");
 }
 
-async function getBuildId(page) {
-  console.log("Bucklerトップページを開きます。");
-  await gotoAndWaitForNextData(page, `${SITE_URL}/6/buckler/${LOCALE}`, "top");
-  const buildId = await page.evaluate(() => window.__NEXT_DATA__ && window.__NEXT_DATA__.buildId);
-  if (!buildId) {
-    await saveDebugSnapshot(page, "top-no-buildid");
-    throw new Error("buildId が取得できませんでした");
-  }
-  return buildId;
-}
-
-// battlelog.json をブラウザ内の fetch() として叩く（cf_clearance等のCookieがそのまま使われる）。
-async function fetchBattlelogPageOnce(page, buildId, pageNum) {
+// battlelog.json をブラウザ内の fetch() として叩く。
+async function fetchBattlelogPageOnce(driver, buildId, pageNum) {
   const url = `${SITE_URL}/6/buckler/_next/data/${buildId}/${LOCALE}/profile/${FIGHTER_ID}/battlelog.json?page=${pageNum}&sid=${FIGHTER_ID}`;
-  const result = await page.evaluate(async (u) => {
-    try {
-      const res = await fetch(u, {
-        headers: { "x-nextjs-data": "1", "Accept": "application/json, text/plain, */*" },
-      });
-      const text = await res.text();
-      const headers = {};
-      res.headers.forEach((v, k) => { headers[k] = v; });
-      return { ok: true, status: res.status, text, headers };
-    } catch (e) {
-      return { ok: false, error: String(e) };
-    }
+  const result = await driver.executeAsyncScript(function (u, callback) {
+    fetch(u, { headers: { "x-nextjs-data": "1", "Accept": "application/json, text/plain, */*" } })
+      .then(function (res) {
+        res.text().then(function (text) {
+          var headers = {};
+          res.headers.forEach(function (v, k) { headers[k] = v; });
+          callback({ ok: true, status: res.status, text: text, headers: headers });
+        });
+      })
+      .catch(function (e) { callback({ ok: false, error: String(e) }); });
   }, url);
 
   if (!result.ok) throw new Error(`ネットワークエラー: ${result.error}（page ${pageNum}）`);
 
-  // エラー時に実際に何が返ってきたかを保存できるよう、常に生データを持たせておく
   const responseDump = [
     `URL: ${url}`,
     `Status: ${result.status}`,
     `cf-ray: ${result.headers["cf-ray"] || "(なし)"}`,
     `cf-mitigated: ${result.headers["cf-mitigated"] || "(なし)"}`,
     `content-type: ${result.headers["content-type"] || "(なし)"}`,
-    `server: ${result.headers["server"] || "(なし)"}`,
     "",
     "----- body -----",
     result.text || "(空)",
@@ -263,43 +275,35 @@ async function fetchBattlelogPageOnce(page, buildId, pageNum) {
 
   if (result.status !== 200) {
     const err = { responseDump };
-    if (result.status === 401) throw Object.assign(err, { retryable: false, message: `HTTP 401: 認証切れです。SF6_SESSION_COOKIE が無効になっています（page ${pageNum}）。` });
-    if (result.status === 403) throw Object.assign(err, { retryable: true, message: `HTTP 403: アクセス拒否されました（page ${pageNum}）。` });
-    if (result.status === 404) throw Object.assign(err, { retryable: false, message: `HTTP 404: ${url} が見つかりませんでした（page ${pageNum}）。` });
+    if (result.status === 401) throw Object.assign(err, { authFailed: true, retryable: false, message: `HTTP 401（page ${pageNum}）。` });
+    if (result.status === 403) throw Object.assign(err, { authFailed: true, retryable: true, message: `HTTP 403（page ${pageNum}）。` });
+    if (result.status === 404) throw Object.assign(err, { retryable: false, message: `HTTP 404: ${url}（page ${pageNum}）。` });
     if (result.status === 429 || result.status >= 500) throw Object.assign(err, { retryable: true, message: `HTTP ${result.status}（page ${pageNum}）。` });
-    throw Object.assign(err, { retryable: false, message: `HTTP ${result.status}: 予期しないエラー（page ${pageNum}）。` });
+    throw Object.assign(err, { retryable: false, message: `HTTP ${result.status}（page ${pageNum}）。` });
   }
-
   try {
     return JSON.parse(result.text);
   } catch (e) {
-    throw { retryable: true, message: `page ${pageNum}: JSONではないレスポンスが返ってきました（チャレンジ画面の可能性）。`, notJson: true, responseDump };
+    throw { retryable: true, authFailed: true, message: `page ${pageNum}: JSONではないレスポンス。`, notJson: true, responseDump };
   }
 }
 
-async function fetchBattlelogPage(page, buildId, pageNum, { maxRetries = 3 } = {}) {
+async function fetchBattlelogPage(driver, buildId, pageNum, { maxRetries = 2 } = {}) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await fetchBattlelogPageOnce(page, buildId, pageNum);
+      return await fetchBattlelogPageOnce(driver, buildId, pageNum);
     } catch (e) {
-      const retryable = typeof e === "object" && e !== null && "retryable" in e ? e.retryable : false;
-      const message = typeof e === "object" && e !== null && "message" in e ? e.message : String(e);
-      const responseDump = typeof e === "object" && e !== null ? e.responseDump : undefined;
-
+      const retryable = e && e.retryable;
+      const message = (e && e.message) || String(e);
       if (!retryable || attempt === maxRetries) {
-        if (responseDump) {
-          saveDebugFile(`debug-battlelog-page${pageNum}-response-${Date.now()}.txt`, responseDump);
-        }
-        await saveDebugSnapshot(page, `battlelog-page${pageNum}-pagestate`);
-        throw new Error(`${message}（output/debug-battlelog-page${pageNum}-response-*.txt を確認してください。page-state系のhtml/pngは実際のAPIレスポンスではなく、その時点のブラウザ画面です）`);
+        if (e && e.responseDump) saveDebugFile(`debug-battlelog-page${pageNum}-response-${Date.now()}.txt`, e.responseDump);
+        const err = new Error(message);
+        err.authFailed = !!(e && e.authFailed);
+        throw err;
       }
       const waitMs = 1000 * Math.pow(2, attempt);
       console.warn(`${message} ${waitMs}ms待ってリトライします（${attempt + 1}/${maxRetries}）`);
       await sleep(waitMs);
-      // チャレンジで弾かれた可能性があるので、リトライ前にトップページを踏み直してセッションを温め直す
-      if (e && e.notJson) {
-        try { await gotoAndWaitForNextData(page, `${SITE_URL}/6/buckler/${LOCALE}`, `retry-top-page${pageNum}`); } catch (_) { /* 次のリトライへ */ }
-      }
     }
   }
 }
@@ -308,16 +312,9 @@ async function fetchBattlelogPage(page, buildId, pageNum, { maxRetries = 3 } = {
 async function fetchExistingReplays() {
   if (!GIST_ID) return [];
   const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
-    headers: {
-      "Authorization": `Bearer ${GIST_TOKEN}`,
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
+    headers: { "Authorization": `Bearer ${GIST_TOKEN}`, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
   });
-  if (!res.ok) {
-    console.warn(`既存Gistの取得に失敗しました（HTTP ${res.status}）。新規扱いとして続行します。`);
-    return [];
-  }
+  if (!res.ok) { console.warn(`既存Gistの取得に失敗しました（HTTP ${res.status}）。新規扱いとして続行します。`); return []; }
   const gist = await res.json();
   const file = gist.files && gist.files[GIST_FILENAME];
   if (!file || !file.content) return [];
@@ -331,157 +328,116 @@ async function fetchExistingReplays() {
   }
 }
 
-// Gistの複数ファイルをまとめて更新する。
 async function uploadToGist(files) {
-  const headers = {
-    "Authorization": `Bearer ${GIST_TOKEN}`,
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "Content-Type": "application/json",
-  };
+  const headers = { "Authorization": `Bearer ${GIST_TOKEN}`, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" };
   if (GIST_ID) {
-    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ files }),
-    });
+    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, { method: "PATCH", headers, body: JSON.stringify({ files }) });
     if (!res.ok) throw new Error(`Gistの更新に失敗しました: HTTP ${res.status} ${await res.text()}`);
     const data = await res.json();
     console.log("Gistを更新しました:", data.html_url);
     return data;
   }
-  const res = await fetch("https://api.github.com/gists", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ description: "SF6 battlelog (sf6-note用)", public: false, files }),
-  });
+  const res = await fetch("https://api.github.com/gists", { method: "POST", headers, body: JSON.stringify({ description: "SF6 battlelog (sf6-note用)", public: false, files }) });
   if (!res.ok) throw new Error(`Gistの作成に失敗しました: HTTP ${res.status} ${await res.text()}`);
   const data = await res.json();
-  console.log("=====================================================");
-  console.log("新しいGistを作成しました。次回以降も同じGistを更新するために、");
-  console.log("リポジトリのSecretsに GIST_ID を以下の値で追加登録してください：");
-  console.log("GIST_ID =", data.id);
-  console.log("Gist URL:", data.html_url);
-  console.log("=====================================================");
+  console.log("新しいGistを作成しました。GIST_ID =", data.id, data.html_url);
   return data;
+}
+
+// buildIdの取得〜battlelog全ページ取得までを1セットとして実行する。
+// 認証エラー（authFailed）で1ページ目から失敗した場合は null を返し、呼び出し元に
+// 「セッションが無効だった」と伝える（＝呼び出し元がログインを試す判断材料にする）。
+async function tryScrapeAllPages(driver, existingIds) {
+  const buildId = await getBuildId(driver);
+  console.log("buildId:", buildId);
+  await sleep(1000);
+
+  const allReplays = [];
+  const rawPages = [];
+  let fighterBannerInfo = null;
+
+  for (let p = 1; p <= MAX_PAGES; p++) {
+    if (p > 1) await sleep(REQUEST_DELAY_MS);
+    let data;
+    try {
+      data = await fetchBattlelogPage(driver, buildId, p);
+    } catch (e) {
+      if (p === 1 && e.authFailed) {
+        console.warn(`page 1 で認証エラー: ${e.message}`);
+        return { sessionInvalid: true };
+      }
+      console.warn(`page ${p} の取得を中断します:`, e.message);
+      break;
+    }
+    console.log(`page ${p}: JSON取得OK`);
+    rawPages.push({ page: p, fetched_at: new Date().toISOString(), data });
+    const pp = data.pageProps || {};
+    if (!fighterBannerInfo) fighterBannerInfo = pp.fighter_banner_info;
+    const list = pp.replay_list || [];
+    console.log(`page ${p}: ${list.length}件 (total_page=${pp.total_page})`);
+    allReplays.push(...list);
+    const allKnown = list.length > 0 && list.every((r) => existingIds.has(r.replay_id));
+    if (allKnown) { console.log(`page ${p} は既知のデータのみでした。打ち切ります。`); break; }
+    if (!list.length || (pp.total_page && p >= pp.total_page)) break;
+  }
+  return { sessionInvalid: false, allReplays, rawPages, fighterBannerInfo };
 }
 
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
-  // 差分取得のため、先に既存データ（前回までの蓄積）を取得しておく
   console.log("既存のGistの中身を確認します。");
   const existingReplays = await fetchExistingReplays();
   const existingIds = new Set(existingReplays.map((r) => r.replay_id));
   console.log(`既存: ${existingReplays.length}件`);
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-    ],
-  });
-  let allReplays = [];
-  let rawPages = [];
-  let fighterBannerInfo = null;
+  const driver = await buildDriver();
+  let result;
 
   try {
-    const context = await browser.newContext({
-      userAgent: UA,
-      locale: "ja-JP",
-      viewport: { width: 1280, height: 800 },
-      timezoneId: "Asia/Tokyo",
-    });
-
-    // Playwright/Puppeteer等の自動操作ブラウザは navigator.webdriver = true や
-    // 空の navigator.plugins など、素のChromiumには無い痕跡を残す。
-    // Cloudflareのbot管理はこれをフィンガープリントの一部として見ているため、
-    // ページ読み込み前にJSで上書きして「普通のブラウザ」に近づける。
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-      Object.defineProperty(navigator, "languages", { get: () => ["ja-JP", "ja"] });
-      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-      // eslint-disable-next-line no-undef
-      window.chrome = window.chrome || { runtime: {} };
-      const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
-      if (originalQuery) {
-        window.navigator.permissions.query = (params) =>
-          params.name === "notifications"
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(params);
-      }
-    });
-
-    const page = await context.newPage();
-
-    if (EMAIL) {
-      await loginWithCredentials(page);
+    // 1. Cookie を試す
+    if (COOKIE_STRING) {
+      console.log("① Cookieでの取得を試します。");
+      await injectCookies(driver, COOKIE_STRING);
+      result = await tryScrapeAllPages(driver, existingIds);
     } else {
-      await context.addCookies(parseCookieString(COOKIE_STRING));
+      result = { sessionInvalid: true };
     }
 
-    const buildId = await getBuildId(page);
-    console.log("buildId:", buildId);
-
-    // 取得直前に少し待つ（トップページ表示直後に即APIを叩くのは機械的に見えるため）
-    await sleep(1500);
-
-    for (let p = 1; p <= MAX_PAGES; p++) {
-      if (p > 1) await sleep(REQUEST_DELAY_MS); // レート制限対策：リクエスト間隔を空ける
-
-      let data;
-      try {
-        data = await fetchBattlelogPage(page, buildId, p);
-      } catch (e) {
-        console.warn(`page ${p} の取得を中断します:`, e.message);
-        break;
+    // 2. ダメならログインを試す（Turnstile等が出たらそこで例外が飛んで終了する）
+    if (result.sessionInvalid) {
+      if (!EMAIL) {
+        throw new Error("Cookieが無効で、CAPCOM_ID_EMAILも未設定のため終了します。SF6_SESSION_COOKIEを手動で更新してください。");
       }
-      console.log(`page ${p}: JSON取得OK`);
-      rawPages.push({ page: p, fetched_at: new Date().toISOString(), data });
+      console.log("② Cookieが無効だったため、ログインを試します。");
+      await loginWithCredentials(driver); // ここでTurnstile検知時は例外を投げて終了する
 
-      const pp = data.pageProps || {};
-      if (!fighterBannerInfo) fighterBannerInfo = pp.fighter_banner_info;
-      const list = pp.replay_list || [];
-      console.log(`page ${p}: ${list.length}件 (total_page=${pp.total_page})`);
-      allReplays.push(...list);
-
-      const allKnown = list.length > 0 && list.every((r) => existingIds.has(r.replay_id));
-      if (allKnown) {
-        console.log(`page ${p} は既知のデータのみでした。これ以降の取得を打ち切ります。`);
-        break;
+      // 3. ログイン成功後のCookieで、もう一度 1 を試す
+      console.log("③ ログイン後のセッションで再度取得を試します。");
+      result = await tryScrapeAllPages(driver, existingIds);
+      if (result.sessionInvalid) {
+        throw new Error("ログイン後もbattlelog.jsonの取得に失敗しました。");
       }
-      if (!list.length || (pp.total_page && p >= pp.total_page)) break;
     }
   } finally {
-    await browser.close();
+    await driver.quit();
   }
 
+  const { allReplays, rawPages, fighterBannerInfo } = result;
   console.log(`今回の取得: ${allReplays.length}件`);
 
   const newReplays = allReplays.filter((r) => !existingIds.has(r.replay_id));
-  const merged = [...existingReplays, ...newReplays]
-    .sort((a, b) => (a.uploaded_at || 0) - (b.uploaded_at || 0));
-
+  const merged = [...existingReplays, ...newReplays].sort((a, b) => (a.uploaded_at || 0) - (b.uploaded_at || 0));
   console.log(`新規: ${newReplays.length}件 / 累計: ${merged.length}件`);
 
-  const dataOutput = {
-    pageProps: {
-      fighter_banner_info: fighterBannerInfo,
-      replay_list: merged,
-      fetched_at: new Date().toISOString(),
-    },
-  };
+  const dataOutput = { pageProps: { fighter_banner_info: fighterBannerInfo, replay_list: merged, fetched_at: new Date().toISOString() } };
   const dataText = JSON.stringify(dataOutput, null, 2);
   const rawText = JSON.stringify({ fetched_at: new Date().toISOString(), pages: rawPages }, null, 2);
 
   fs.writeFileSync(path.join(OUT_DIR, GIST_FILENAME), dataText);
   fs.writeFileSync(path.join(OUT_DIR, GIST_RAW_FILENAME), rawText);
 
-  await uploadToGist({
-    [GIST_FILENAME]: { content: dataText },
-    [GIST_RAW_FILENAME]: { content: rawText },
-  });
+  await uploadToGist({ [GIST_FILENAME]: { content: dataText }, [GIST_RAW_FILENAME]: { content: rawText } });
 }
 
 main().catch((e) => {
