@@ -239,7 +239,13 @@ async function main() {
   const existingIds = new Set(existingReplays.map((r) => r.replay_id));
   console.log(`既存: ${existingReplays.length}件`);
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+    ],
+  });
   let allReplays = [];
   let rawPages = [];
   let fighterBannerInfo = null;
@@ -249,12 +255,36 @@ async function main() {
       userAgent: UA,
       locale: "ja-JP",
       viewport: { width: 1280, height: 800 },
+      timezoneId: "Asia/Tokyo",
     });
+
+    // Playwright/Puppeteer等の自動操作ブラウザは navigator.webdriver = true や
+    // 空の navigator.plugins など、素のChromiumには無い痕跡を残す。
+    // Cloudflareのbot管理はこれをフィンガープリントの一部として見ているため、
+    // ページ読み込み前にJSで上書きして「普通のブラウザ」に近づける。
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "languages", { get: () => ["ja-JP", "ja"] });
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+      // eslint-disable-next-line no-undef
+      window.chrome = window.chrome || { runtime: {} };
+      const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+      if (originalQuery) {
+        window.navigator.permissions.query = (params) =>
+          params.name === "notifications"
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(params);
+      }
+    });
+
     await context.addCookies(parseCookieString(COOKIE_STRING));
     const page = await context.newPage();
 
     const buildId = await getBuildId(page);
     console.log("buildId:", buildId);
+
+    // 取得直前に少し待つ（トップページ表示直後に即APIを叩くのは機械的に見えるため）
+    await sleep(1500);
 
     for (let p = 1; p <= MAX_PAGES; p++) {
       if (p > 1) await sleep(REQUEST_DELAY_MS); // レート制限対策：リクエスト間隔を空ける
