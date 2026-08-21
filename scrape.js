@@ -1,45 +1,34 @@
 // Buckler's Boot Camp（SF6公式サイト）内部APIから対戦履歴を直接取得し、
 // スト6攻略ノートアプリがそのままインポートできる形式でGistへアップロードする。
 //
-// 方針：
-// - Playwright等のブラウザ自動化は使わない（Bot対策に検知されうるため）。
-//   ログインも素のHTTPリクエスト（fetch + 手作りCookie Jar）だけで行う。
-//   ブラウザを一切起動しないので、Bot判定の対象になりようがない。
-// - ログイン方法は2通り対応：
-//   ① CAPCOM_ID_EMAIL / CAPCOM_ID_PASSWORD が設定されていれば、毎回HTTPでログインしてCookieを得る
-//   ② SF6_SESSION_COOKIE が設定されていれば、それをそのまま使う（①が使えない場合の手動フォールバック）
-// - replay_id を主キーとした差分取得（前回までに取得済みのreplay_idに行き当たったら
-//   それ以降のページは取得を打ち切る＝無駄なリクエストをしない）。
-// - HTTPステータスごとに挙動を分ける（429は待ってリトライ、401/403は即座に諦める等）。
-// - 生のAPIレスポンス（raw）と、アプリ用に蓄積した結果（data）を分けてGistに保存する。
+// v5: ログイン自動化（CAPCOM_ID_EMAIL/PASSWORD）を廃止し、SF6_SESSION_COOKIE方式のみに一本化。
+//     https://github.com/alanoliveira/sfbuff の「Cookie直指定フォールバック」方式に寄せた、
+//     最小構成版。
 //
-// 注意：httpLogin()内のフィールド名（client_id, connection, state, _csrf 等）は
-// 実際にDevToolsで確認できた /usernamepassword/login への送信内容そのもの。
-// ただし state/_csrf をログインページのHTMLからどう抽出するか、POST後のレスポンスが
-// リダイレクトかHTML自動送信フォームかは未検証。失敗した場合は
-// output/debug-login-*.html にその時点のレスポンスを保存するので、それを見て調整する。
+// 流れ：
+// 1. Bucklerトップページ（/6/buckler/{locale}）をSF6_SESSION_COOKIE付きで取得
+// 2. レスポンスHTML中の __NEXT_DATA__ から buildId を抽出
+// 3. battlelog.json（page=1）を取得し、JSONとして解釈できるか確認
+//    　→ できない場合はCookie切れ（ログイン画面のHTMLが返ってきている）と判断して即終了
+// 4. page=1〜10を順に取得（既知のreplay_idしか無いページに当たったら打ち切り）
+// 5. 既存Gistの中身と replay_id で突き合わせ、新規分だけ追加してGistを更新
 //
 // 必要な環境変数（GitHub Secrets経由で渡す想定）:
-//   CAPCOM_ID_EMAIL      … CAPCOM IDのログインメールアドレス（①の方式・推奨）
-//   CAPCOM_ID_PASSWORD   … CAPCOM IDのログインパスワード（①の方式・推奨）
-//   SF6_SESSION_COOKIE  … ログイン済みブラウザからコピーしたCookie文字列（②の方式・フォールバック）
+//   SF6_SESSION_COOKIE   … ログイン済みブラウザからコピーしたCookie文字列（必須）
 //   SF6_FIGHTER_ID       … 自分のCFNプレイヤーID（プロフィールページURLの数字部分）
 //   SF6_LOCALE           … 省略時 "ja-jp"
-//   SF6_MAX_PAGES         … 省略時 20（安全のための上限ページ数）
-//   SF6_REQUEST_DELAY_MS   … 省略時 400（各リクエストの間隔・レート制限対策）
-//   GIST_TOKEN            … Gist更新用のPersonal Access Token（gistスコープ）
-//   GIST_ID               … 更新先のGist ID
+//   SF6_REQUEST_DELAY_MS … 省略時 400（各リクエストの間隔・レート制限対策）
+//   GIST_TOKEN           … Gist更新用のPersonal Access Token（gistスコープ）
+//   GIST_ID              … 更新先のGist ID
 
 const fs = require("fs");
 const path = require("path");
 
-const EMAIL = process.env.CAPCOM_ID_EMAIL || "";
-const PASSWORD = process.env.CAPCOM_ID_PASSWORD || "";
-const MANUAL_COOKIE = process.env.SF6_SESSION_COOKIE || "";
+const COOKIE = process.env.SF6_SESSION_COOKIE || "";
 const FIGHTER_ID = process.env.SF6_FIGHTER_ID || "";
 const LOCALE = process.env.SF6_LOCALE || "ja-jp";
-const MAX_PAGES = parseInt(process.env.SF6_MAX_PAGES || "20", 10);
 const REQUEST_DELAY_MS = parseInt(process.env.SF6_REQUEST_DELAY_MS || "400", 10);
+const MAX_PAGES = 10; // page=1〜10固定
 const OUT_DIR = path.join(__dirname, "output");
 
 const GIST_TOKEN = process.env.GIST_TOKEN || "";
@@ -49,109 +38,31 @@ const GIST_RAW_FILENAME = "battlelog-raw.json";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-if (!EMAIL && !MANUAL_COOKIE) { console.error("CAPCOM_ID_EMAIL/CAPCOM_ID_PASSWORD か SF6_SESSION_COOKIE のいずれかが必要です"); process.exit(1); }
-if (EMAIL && !PASSWORD) { console.error("CAPCOM_ID_EMAIL はあるが CAPCOM_ID_PASSWORD がありません"); process.exit(1); }
+if (!COOKIE) { console.error("SF6_SESSION_COOKIE が設定されていません"); process.exit(1); }
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
 if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-/* ------------------------------------------------------------------------
-   簡易Cookie Jar（ブラウザなしで複数リクエストにまたがってCookieを保持する）
-   ------------------------------------------------------------------------ */
-class CookieJar {
-  constructor() { this.map = new Map(); }
-  // fetch()のResponseとgot-scrapingのResponseの両方に対応できるよう、
-  // Set-Cookie配列を直接渡す形にしている
-  absorbList(setCookieList) {
-    (setCookieList || []).forEach((sc) => {
-      const pair = sc.split(";")[0];
-      const eq = pair.indexOf("=");
-      if (eq > -1) this.map.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
-    });
+// got-scraping はESM専用パッケージなので動的importで読み込む（初回のみ）。
+// TLS/HTTP2フィンガープリントを本物のブラウザに近づけ、Cloudflareの単純なbot判定を回避する。
+let _gotScraping = null;
+async function loadGotScraping() {
+  if (!_gotScraping) {
+    const mod = await import("got-scraping");
+    _gotScraping = mod.gotScraping;
   }
-  header() { return [...this.map.entries()].map(([k, v]) => `${k}=${v}`).join("; "); }
+  return _gotScraping;
 }
 
-function extractSetCookies(res) {
-  // got-scraping（Node標準のhttpヘッダー）は headers['set-cookie'] が配列
-  if (res.headers && res.headers["set-cookie"]) return res.headers["set-cookie"];
-  return [];
-}
-
-// リダイレクトを自前で1段ずつ辿る（Cookieを都度吸収するため followRedirect:false にしている）。
-// got-scraping を使うことで、ログイン系のリクエストにも本物のブラウザに近いTLS/HTTP2の
-// 指紋を持たせる。
-async function fetchFollow(jar, url, opts = {}, maxHops = 10) {
-  const gotScraping = await loadGotScraping();
-  let current = url;
-  let curOpts = opts;
-  for (let i = 0; i < maxHops; i++) {
-    const res = await gotScraping({
-      url: current,
-      method: curOpts.method || "GET",
-      body: curOpts.body,
-      headers: { "User-Agent": UA, Cookie: jar.header(), ...(curOpts.headers || {}) },
-      followRedirect: false,
-      throwHttpErrors: false,
-      timeout: { request: 30000 },
-    });
-    jar.absorbList(extractSetCookies(res));
-    if (res.statusCode >= 300 && res.statusCode < 400) {
-      const loc = res.headers.location;
-      if (!loc) return res;
-      current = new URL(loc, current).toString();
-      curOpts = {}; // リダイレクト先へはGETで辿る
-      continue;
-    }
-    return res;
-  }
-  throw new Error("リダイレクトが多すぎます（10回超）");
-}
-
-// ネストしたオブジェクトから指定キーを再帰的に探す（Auth0の設定JSONのネスト位置が
-// 分からないため、位置に依存せず値を拾えるようにしている）
-function findDeep(obj, key, depth = 0) {
-  if (depth > 6 || obj == null || typeof obj !== "object") return undefined;
-  if (key in obj) return obj[key];
-  for (const k of Object.keys(obj)) {
-    const found = findDeep(obj[k], key, depth + 1);
-    if (found !== undefined) return found;
-  }
-  return undefined;
-}
-
-// ログインページのHTMLから state / _csrf を抽出する。
-// Auth0 Lock系のページは base64エンコードしたJSON設定を window.atob(...) に埋め込むことが多いので
-// まずそれを試し、ダメなら生のHTML中の "state":"..." / "_csrf":"..." を直接拾う。
-function extractStateAndCsrf(html) {
-  let state, csrf;
-  const b64Match = html.match(/window\.atob\(['"]([^'"]+)['"]\)/);
-  if (b64Match) {
-    try {
-      const decoded = decodeURIComponent(escape(Buffer.from(b64Match[1], "base64").toString("binary")));
-      const cfg = JSON.parse(decoded);
-      state = findDeep(cfg, "state");
-      csrf = findDeep(cfg, "_csrf");
-    } catch (e) { /* フォールバックへ */ }
-  }
-  if (!state) { const m = html.match(/"state"\s*:\s*"([^"]+)"/); if (m) state = m[1]; }
-  if (!csrf) { const m = html.match(/"_csrf"\s*:\s*"([^"]+)"/); if (m) csrf = m[1]; }
-  return { state, csrf };
-}
-
-// HTML中の最初の<form>のaction先と、hidden inputの値を抜き出す
-// （/usernamepassword/login のレスポンスが「自動送信フォーム」だった場合の中継用）
-function extractFirstForm(html) {
-  const formMatch = html.match(/<form[^>]*action="([^"]*)"[^>]*>([\s\S]*?)<\/form>/i);
-  if (!formMatch) return null;
-  const action = formMatch[1];
-  const body = formMatch[2];
-  const inputs = {};
-  const inputRe = /<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/gi;
-  let m;
-  while ((m = inputRe.exec(body))) inputs[m[1]] = m[2];
-  return { action, inputs };
+function authHeaders() {
+  return {
+    "User-Agent": UA,
+    Cookie: COOKIE,
+    "Accept": "*/*",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Referer": `https://www.streetfighter.com/6/buckler/${LOCALE}/profile/${FIGHTER_ID}`,
+  };
 }
 
 function saveDebugHtml(name, html) {
@@ -162,133 +73,8 @@ function saveDebugHtml(name, html) {
   } catch (e) { /* noop */ }
 }
 
-// CAPCOM IDのメール・パスワードでHTTPのみでログインし、Cookie文字列を返す。
-async function httpLogin(email, password) {
-  const gotScraping = await loadGotScraping();
-  const jar = new CookieJar();
-
-  console.log("ログイン起点へアクセス（リダイレクトを辿ります）");
-  const loginPageRes = await fetchFollow(
-    jar,
-    `https://www.streetfighter.com/6/buckler/${LOCALE}/auth/loginep?redirect_url=/`
-  );
-  const loginHtml = loginPageRes.body;
-  const { state, csrf } = extractStateAndCsrf(loginHtml);
-  if (!state || !csrf) {
-    saveDebugHtml("debug-login-page.html", loginHtml);
-    throw new Error("ログインページから state/_csrf を抽出できませんでした（output/debug-login-page.html を確認してください）");
-  }
-  console.log("state/_csrf を取得しました");
-
-  const body = {
-    client_id: "mVxOARlAyTcJkcFAb8IZoiKYV8qGAH9a",
-    connection: "Username-Password-Authentication",
-    password,
-    popup_options: {},
-    protocol: "oauth2",
-    redirect_uri: "https://cid.capcom.com/ja/loginCallback",
-    response_type: "code",
-    scope: "openid profile email",
-    show_sing_up: "0",
-    sso: true,
-    state,
-    tenant: "capcom",
-    ui_locales: "ja",
-    username: email,
-    _csrf: csrf,
-    _intstate: "deprecated",
-  };
-
-  console.log("ユーザー名・パスワードを送信します");
-  let res = await gotScraping({
-    url: "https://auth.cid.capcom.com/usernamepassword/login",
-    method: "POST",
-    headers: {
-      "User-Agent": UA,
-      "Content-Type": "application/json",
-      "Origin": "https://auth.cid.capcom.com",
-      "Referer": loginPageRes.url ? String(loginPageRes.url) : "https://auth.cid.capcom.com/login",
-      Cookie: jar.header(),
-    },
-    body: JSON.stringify(body),
-    followRedirect: false,
-    throwHttpErrors: false,
-    timeout: { request: 30000 },
-  });
-  jar.absorbList(extractSetCookies(res));
-
-  // ケースA: 素直にリダイレクトが返ってくる場合
-  if (res.statusCode >= 300 && res.statusCode < 400) {
-    const loc = res.headers.location;
-    if (loc) {
-      res = await fetchFollow(jar, new URL(loc, "https://auth.cid.capcom.com").toString());
-    }
-  } else if (res.statusCode >= 200 && res.statusCode < 300) {
-    // ケースB: Auth0特有の「自動送信フォームを含むHTML」が返ってくる場合
-    const html = res.body;
-    const form = extractFirstForm(html);
-    if (!form) {
-      saveDebugHtml("debug-login-response.html", html);
-      throw new Error("ログイン後のレスポンスを解釈できませんでした（output/debug-login-response.html を確認してください）");
-    }
-    const formBody = new URLSearchParams(form.inputs).toString();
-    res = await fetchFollow(jar, new URL(form.action, "https://auth.cid.capcom.com").toString(), {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: formBody,
-    });
-  } else {
-    saveDebugHtml("debug-login-error.html", res.body || "");
-    throw new Error(`ログインに失敗しました（HTTP ${res.statusCode}）。output/debug-login-error.html を確認してください。パスワードやフィールド名が変わった可能性があります。`);
-  }
-
-  // 最終的に streetfighter.com のドメインに戻ってきているか確認
-  const finalUrl = res.url ? String(res.url) : "";
-  if (!finalUrl.includes("streetfighter.com")) {
-    saveDebugHtml("debug-login-final.html", res.body || "");
-    throw new Error(`ログイン後の最終遷移先が streetfighter.com になっていません（${finalUrl}）。output/debug-login-final.html を確認してください。`);
-  }
-
-  console.log("ログイン成功。Cookieを取得しました。");
-  return jar.header();
-}
-
-/* ------------------------------------------------------------------------
-   ここから通常の戦績取得（既存のCookie方式ロジックはそのまま）
-   ------------------------------------------------------------------------ */
-
-let COOKIE = MANUAL_COOKIE;
-
-function authHeaders() {
-  return {
-    "Cookie": COOKIE,
-    "User-Agent": UA,
-    "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": `https://www.streetfighter.com/6/buckler/${LOCALE}/`,
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-  };
-}
-
 // HTTPステータスに応じて処理を分ける汎用フェッチ。
 // 429/5xx系はしばらく待ってリトライ（最大3回）、401/403/404は即座に諦めて呼び出し元に伝える。
-// got-scraping はESM専用パッケージなので動的importで読み込む（初回のみ）
-let _gotScraping = null;
-async function loadGotScraping() {
-  if (!_gotScraping) {
-    const mod = await import("got-scraping");
-    _gotScraping = mod.gotScraping;
-  }
-  return _gotScraping;
-}
-
 async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
   const gotScraping = await loadGotScraping();
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -299,7 +85,6 @@ async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
         headers: authHeaders(),
         throwHttpErrors: false,
         timeout: { request: 30000 },
-        // ヘッダーは自前で全部指定するので、got-scraping側の自動生成で上書きさせない
         headerGeneratorOptions: undefined,
       });
     } catch (e) {
@@ -312,7 +97,7 @@ async function fetchWithRetry(url, { maxRetries = 3 } = {}) {
     if (res.statusCode >= 200 && res.statusCode < 300) return res;
 
     if (res.statusCode === 401) {
-      throw new Error("HTTP 401: 認証切れです。Cookieが無効になっています。");
+      throw new Error("HTTP 401: 認証切れです。SF6_SESSION_COOKIE が無効になっています。再取得して登録し直してください。");
     }
     if (res.statusCode === 403) {
       throw new Error("HTTP 403: アクセス拒否されました（Bot判定等）。連続で叩き続けると悪化する可能性があるため、ここで中断します。");
@@ -336,20 +121,39 @@ async function fetchText(url) {
   return res.body;
 }
 
-// プロフィールページのHTMLから __NEXT_DATA__ に埋め込まれた buildId を取り出す。
-async function getBuildId() {
-  const html = await fetchText(`https://www.streetfighter.com/6/buckler/${LOCALE}/profile/${FIGHTER_ID}`);
+// 1. Bucklerトップページを取得し、2. __NEXT_DATA__ から buildId を抽出する。
+async function getBuildIdFromTop() {
+  console.log("Bucklerトップページを取得します。");
+  const html = await fetchText(`https://www.streetfighter.com/6/buckler/${LOCALE}`);
   const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (!m) throw new Error("__NEXT_DATA__ が見つかりませんでした（ページ構造が変わった、またはCookieが無効な可能性があります）");
-  const data = JSON.parse(m[1]);
+  if (!m) {
+    saveDebugHtml("debug-top.html", html);
+    throw new Error("__NEXT_DATA__ が見つかりませんでした（Cookieが無効、またはページ構造が変わった可能性があります。output/debug-top.html を確認してください）");
+  }
+  let data;
+  try {
+    data = JSON.parse(m[1]);
+  } catch (e) {
+    saveDebugHtml("debug-top.html", html);
+    throw new Error("__NEXT_DATA__ のJSONパースに失敗しました（output/debug-top.html を確認してください）");
+  }
   if (!data.buildId) throw new Error("buildId が取得できませんでした");
   return data.buildId;
 }
 
+// 3. battlelog.json（page指定）を取得し、JSONとして返ってきているか確認する。
+//    Cookie切れ等でログイン画面（HTML）が返ってきた場合はここで検知する。
 async function fetchBattlelogPage(buildId, page) {
   const url = `https://www.streetfighter.com/6/buckler/_next/data/${buildId}/${LOCALE}/profile/${FIGHTER_ID}/battlelog.json?page=${page}&sid=${FIGHTER_ID}`;
   const text = await fetchText(url);
-  return JSON.parse(text);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    saveDebugHtml(`debug-battlelog-page${page}.html`, text);
+    throw new Error(`page ${page}: JSONではないレスポンスが返ってきました（Cookie切れの可能性。output/debug-battlelog-page${page}.html を確認してください）`);
+  }
+  return data;
 }
 
 // 既存Gistの中身（前回までに蓄積した対戦履歴・data側）を取得する。
@@ -417,11 +221,7 @@ async function uploadToGist(files) {
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
-  if (EMAIL) {
-    COOKIE = await httpLogin(EMAIL, PASSWORD);
-  } else {
-    console.log("SF6_SESSION_COOKIE（手動Cookie）を使用します。");
-  }
+  console.log("SF6_SESSION_COOKIE を使用します。");
 
   // 差分取得のため、先に既存データ（前回までの蓄積）を取得しておく
   console.log("既存のGistの中身を確認します。");
@@ -429,7 +229,7 @@ async function main() {
   const existingIds = new Set(existingReplays.map((r) => r.replay_id));
   console.log(`既存: ${existingReplays.length}件`);
 
-  const buildId = await getBuildId();
+  const buildId = await getBuildIdFromTop();
   console.log("buildId:", buildId);
 
   let fighterBannerInfo = null;
@@ -446,6 +246,7 @@ async function main() {
       console.warn(`page ${p} の取得を中断します:`, e.message);
       break;
     }
+    console.log(`page ${p}: JSON取得OK`);
     rawPages.push({ page: p, fetched_at: new Date().toISOString(), data });
 
     const pp = data.pageProps || {};
