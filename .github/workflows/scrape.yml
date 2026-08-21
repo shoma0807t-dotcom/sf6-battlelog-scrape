@@ -3,6 +3,7 @@ name: Scrape SF6 battlelog
 on:
   workflow_dispatch: {}
   schedule:
+    # 毎日 21:00 JST（12:00 UTC）に自動実行。不要なら削除してOK。
     - cron: "0 12 * * *"
 
 jobs:
@@ -26,8 +27,6 @@ jobs:
 
       - name: Run scraper
         env:
-          CAPCOM_ID_EMAIL: ${{ secrets.CAPCOM_ID_EMAIL }}
-          CAPCOM_ID_PASSWORD: ${{ secrets.CAPCOM_ID_PASSWORD }}
           SF6_SESSION_COOKIE: ${{ secrets.SF6_SESSION_COOKIE }}
           SF6_FIGHTER_ID: ${{ secrets.SF6_FIGHTER_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
