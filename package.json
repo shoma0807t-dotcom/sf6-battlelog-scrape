@@ -1,12 +1,12 @@
 {
   "name": "sf6-battlelog-scraper",
   "private": true,
-  "version": "6.0.0",
-  "description": "SF6_SESSION_COOKIE方式＋Playwright（Chromiumヘッドレス）でSF6の対戦履歴を取得しGistへ蓄積するスクリプト",
+  "version": "7.0.0",
+  "description": "SF6の対戦履歴を取得しGistへ蓄積するスクリプト（Selenium WebDriver使用、Cookie優先・ログインはフォールバック）",
   "scripts": {
     "scrape": "node scrape.js"
   },
   "dependencies": {
-    "playwright": "^1.47.0"
+    "selenium-webdriver": "^4.25.0"
   }
 }
