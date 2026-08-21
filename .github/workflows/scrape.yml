@@ -25,20 +25,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Cache Playwright browser binary
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ hashFiles('package.json') }}
-
-      - name: Install Playwright browser (Chromium only)
-        run: npx playwright install --with-deps chromium
-
       - name: Run scraper
         env:
           CAPCOM_ID_EMAIL: ${{ secrets.CAPCOM_ID_EMAIL }}
           CAPCOM_ID_PASSWORD: ${{ secrets.CAPCOM_ID_PASSWORD }}
+          SF6_SESSION_COOKIE: ${{ secrets.SF6_SESSION_COOKIE }}
           SF6_FIGHTER_ID: ${{ secrets.SF6_FIGHTER_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
@@ -50,6 +41,5 @@ jobs:
         with:
           name: debug-output
           path: |
-            output/debug-last-page.png
-            output/debug-last-url.txt
+            output/debug-*.html
           if-no-files-found: ignore
