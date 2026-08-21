@@ -19,12 +19,22 @@
 // 5. 既存Gistの中身と replay_id で突き合わせ、新規分だけ追加してGistを更新
 //
 // 必要な環境変数（GitHub Secrets経由で渡す想定）:
-//   SF6_SESSION_COOKIE   … ログイン済みブラウザからコピーしたCookie文字列（必須）
+//   SF6_SESSION_COOKIE   … ログイン済みブラウザからコピーしたCookie文字列
+//   CAPCOM_ID_EMAIL      … CAPCOM IDのログインメールアドレス（未設定ならCookie方式を使う）
+//   CAPCOM_ID_PASSWORD   … CAPCOM IDのログインパスワード（EMAILとセットで必須）
 //   SF6_FIGHTER_ID       … 自分のCFNプレイヤーID（プロフィールページURLの数字部分）
 //   SF6_LOCALE           … 省略時 "ja-jp"
 //   SF6_REQUEST_DELAY_MS … 省略時 800（各リクエストの間隔・レート制限対策）
 //   GIST_TOKEN           … Gist更新用のPersonal Access Token（gistスコープ）
 //   GIST_ID              … 更新先のGist ID
+//
+// ログイン方式の優先順位：
+//   ① CAPCOM_ID_EMAIL / CAPCOM_ID_PASSWORD が設定されていれば、毎回ブラウザでログインし直す
+//     （Cookieの手動更新が不要になる。以前のHTTP-onlyログインが失敗していたのは
+//      JS実行が必要なインタラクティブチャレンジが原因だったが、Playwrightは実ブラウザなので
+//      理論上は通るはず。ただしCAPCOM ID側のログインフォームの正確なDOM構造は未検証なので、
+//      うまくいかない場合は output/debug-login-*.html/.png を見ながら調整が必要）
+//   ② ①が無ければ SF6_SESSION_COOKIE を使う（従来通り、手動更新が必要）
 //
 // 事前準備（package.json の postinstall、またはCIのステップで）:
 //   npx playwright install --with-deps chromium
@@ -34,6 +44,8 @@ const path = require("path");
 const { chromium } = require("playwright");
 
 const COOKIE_STRING = process.env.SF6_SESSION_COOKIE || "";
+const EMAIL = process.env.CAPCOM_ID_EMAIL || "";
+const PASSWORD = process.env.CAPCOM_ID_PASSWORD || "";
 const FIGHTER_ID = process.env.SF6_FIGHTER_ID || "";
 const LOCALE = process.env.SF6_LOCALE || "ja-jp";
 const REQUEST_DELAY_MS = parseInt(process.env.SF6_REQUEST_DELAY_MS || "800", 10);
@@ -49,7 +61,8 @@ const GIST_RAW_FILENAME = "battlelog-raw.json";
 const SITE_URL = "https://www.streetfighter.com";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-if (!COOKIE_STRING) { console.error("SF6_SESSION_COOKIE が設定されていません"); process.exit(1); }
+if (!EMAIL && !COOKIE_STRING) { console.error("CAPCOM_ID_EMAIL/CAPCOM_ID_PASSWORD か SF6_SESSION_COOKIE のいずれかが必要です"); process.exit(1); }
+if (EMAIL && !PASSWORD) { console.error("CAPCOM_ID_EMAIL はあるが CAPCOM_ID_PASSWORD がありません"); process.exit(1); }
 if (!FIGHTER_ID) { console.error("SF6_FIGHTER_ID が設定されていません"); process.exit(1); }
 if (!GIST_TOKEN) { console.error("GIST_TOKEN が設定されていません"); process.exit(1); }
 
@@ -102,6 +115,107 @@ async function gotoAndWaitForNextData(page, url, label) {
     await saveDebugSnapshot(page, label);
     throw new Error(`ページの読み込みがタイムアウトしました（Cloudflareのチャレンジで止まっている、またはCookieが無効な可能性。output/debug-${label}-*.html/.png を確認してください）`);
   }
+}
+
+// 複数の候補セレクタから、実際に表示されている最初の要素を返す。
+// CAPCOM IDのログインフォームの正確なDOM構造が未検証なため、よくあるパターンを
+// 複数試す形にしている。全滅した場合はデバッグ用スナップショットを見て調整する。
+async function findFirstVisible(page, selectors, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      try {
+        if (await loc.isVisible({ timeout: 300 })) return loc;
+      } catch (e) { /* この候補は無し、次へ */ }
+    }
+    await sleep(300);
+  }
+  return null;
+}
+
+const USERNAME_SELECTORS = [
+  'input[name="username"]',
+  'input[name="email"]',
+  'input#username',
+  'input#email',
+  'input[type="email"]',
+  'input[autocomplete="username"]',
+];
+const PASSWORD_SELECTORS = [
+  'input[name="password"]',
+  'input#password',
+  'input[type="password"]',
+  'input[autocomplete="current-password"]',
+];
+const SUBMIT_SELECTORS = [
+  'button[type="submit"]',
+  'button[name="action"]',
+  'button:has-text("ログイン")',
+  'button:has-text("Log in")',
+  'button:has-text("Log In")',
+  'button:has-text("Continue")',
+  'button:has-text("続ける")',
+  'input[type="submit"]',
+];
+
+// CAPCOM IDでログインし、streetfighter.com側の認証Cookieをブラウザcontextに獲得させる。
+// フォームが「メール+パスワードが同じ画面」なのか「メール→次画面でパスワード」の
+// 2段階なのかが事前に分からないため、両方に対応できるようにしている。
+async function loginWithCredentials(page) {
+  console.log("CAPCOM IDでログインします。");
+  await page.goto(`${SITE_URL}/6/buckler/${LOCALE}/auth/loginep?redirect_url=/6/buckler/${LOCALE}`, {
+    waitUntil: "domcontentloaded",
+    timeout: NAV_TIMEOUT_MS,
+  });
+  await saveDebugSnapshot(page, "login-step1-loaded");
+
+  const usernameField = await findFirstVisible(page, USERNAME_SELECTORS);
+  if (!usernameField) {
+    await saveDebugSnapshot(page, "login-no-username-field");
+    throw new Error("ログインフォームのメール/ユーザー名欄が見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
+  }
+  await usernameField.fill(EMAIL);
+
+  // 同一画面にパスワード欄も既にあるか確認（Auth0 Lock系＝1画面完結パターン）
+  let passwordField = await findFirstVisible(page, PASSWORD_SELECTORS, 1500);
+
+  if (!passwordField) {
+    // 無ければ「次へ」的なボタンを押して2画面目（パスワード入力）に進む
+    const nextButton = await findFirstVisible(page, SUBMIT_SELECTORS);
+    if (!nextButton) {
+      await saveDebugSnapshot(page, "login-no-next-button");
+      throw new Error("メール入力後の「次へ」ボタンが見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
+    }
+    await nextButton.click();
+    await saveDebugSnapshot(page, "login-step2-after-username-submit");
+    passwordField = await findFirstVisible(page, PASSWORD_SELECTORS);
+  }
+
+  if (!passwordField) {
+    await saveDebugSnapshot(page, "login-no-password-field");
+    throw new Error("ログインフォームのパスワード欄が見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
+  }
+  await passwordField.fill(PASSWORD);
+
+  const loginButton = await findFirstVisible(page, SUBMIT_SELECTORS);
+  if (!loginButton) {
+    await saveDebugSnapshot(page, "login-no-submit-button");
+    throw new Error("ログインボタンが見つかりませんでした（output/debug-login-*.html/.png を確認してください）");
+  }
+
+  await Promise.all([
+    page.waitForURL((u) => u.hostname.includes("streetfighter.com"), { timeout: NAV_TIMEOUT_MS }).catch(() => {}),
+    loginButton.click(),
+  ]);
+  await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => {});
+  await saveDebugSnapshot(page, "login-result");
+
+  const url = page.url();
+  if (!url.includes("streetfighter.com")) {
+    throw new Error(`ログイン後にstreetfighter.comへ戻ってきませんでした（現在のURL: ${url}）。メールアドレス/パスワードが誤っている、もしくは追加の確認（2段階認証等）が必要な可能性があります。output/debug-login-result-*.html/.png を確認してください。`);
+  }
+  console.log("ログインに成功したとみられます。streetfighter.com に戻りました。");
 }
 
 async function getBuildId(page) {
@@ -299,8 +413,13 @@ async function main() {
       }
     });
 
-    await context.addCookies(parseCookieString(COOKIE_STRING));
     const page = await context.newPage();
+
+    if (EMAIL) {
+      await loginWithCredentials(page);
+    } else {
+      await context.addCookies(parseCookieString(COOKIE_STRING));
+    }
 
     const buildId = await getBuildId(page);
     console.log("buildId:", buildId);
