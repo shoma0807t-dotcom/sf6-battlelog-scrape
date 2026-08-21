@@ -3,18 +3,27 @@ name: Scrape SF6 battlelog
 on:
   workflow_dispatch: {}
   schedule:
+    # 毎日 21:00 JST（12:00 UTC）に自動実行。不要なら削除してOK。
     - cron: "0 12 * * *"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package.json') }}
+
+      - name: Install dependencies
+        run: npm install
 
       - name: Run scraper
         env:
@@ -26,18 +35,11 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
         run: node scrape.js
 
-      - name: Show debug files
-        if: always()
-        run: |
-          echo "=== output directory ==="
-          ls -la output 2>/dev/null || echo "output does not exist"
-          echo "=== all files ==="
-          find . -maxdepth 4 -type f -print
-
-      - name: Upload debug artifacts
-        if: always()
+      - name: Upload debug artifacts on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-output
-          path: output/
-          if-no-files-found: warn
+          path: |
+            output/debug-*.html
+          if-no-files-found: ignore
