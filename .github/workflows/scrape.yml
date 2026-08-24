@@ -3,13 +3,12 @@ name: Scrape SF6 battlelog
 on:
   workflow_dispatch: {}
   schedule:
-    # 毎日 21:00 JST（12:00 UTC）
+    # 毎日 21:00 JST（12:00 UTC）に自動実行。不要なら削除してOK。
     - cron: "0 12 * * *"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -26,8 +25,16 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      # Chrome / ChromeDriverのセットアップは不要
-      # Bright Data Scraping Browserへリモート接続する
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+
+      - name: Setup chromedriver
+        uses: nanasess/setup-chromedriver@v2
+        with:
+          chromedriver-version: ${{ steps.setup-chrome.outputs.chrome-version }}
 
       - name: Run scraper
         env:
@@ -37,10 +44,6 @@ jobs:
           SF6_FIGHTER_ID: ${{ secrets.SF6_FIGHTER_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
-
-          # Bright Data Scraping Browser
-          BRIGHT_DATA_SCRAPING_BROWSER_URL: ${{ secrets.BRIGHT_DATA_SCRAPING_BROWSER_URL }}
-
         run: node scrape.js
 
       - name: Upload debug artifacts (if any)
